@@ -6,6 +6,7 @@ use body_sim::params::Params;
 use body_sim::report::View;
 use body_sim::tissue::Tissue;
 use macroquad::prelude::*;
+use rayon::prelude::*;
 
 use crate::paint::{self, CellLook, SectionGeom};
 
@@ -181,24 +182,36 @@ impl OrbitCam {
 struct Face {
     tex: Texture2D,
     rgba: Vec<u8>,
+    /// Нетронутые слои кожи — копируются в «спокойные» столбцы.
+    base: Vec<u8>,
     geom: SectionGeom,
     mesh: Mesh,
+    seed: u32,
+    /// Для какого состояния сцены текстура нарисована.
+    painted: Option<(u64, usize)>,
 }
 
 impl Face {
-    fn new(cells_along: usize) -> Self {
+    fn new(p: &Params, cells_along: usize, seed: u32) -> Self {
         let geom = SectionGeom { w: cells_along * TEX_PX_PER_CELL, h: TEX_H, top_mm: TEX_TOP_MM, px_per_mm: TEX_PX_PER_MM };
-        let rgba = vec![0u8; geom.w * geom.h * 4];
-        let tex = Texture2D::from_rgba8(geom.w as u16, geom.h as u16, &rgba);
+        let mut base = vec![0u8; geom.w * geom.h * 4];
+        paint::paint_base(p, cells_along, &geom, &mut base, seed);
+        let tex = Texture2D::from_rgba8(geom.w as u16, geom.h as u16, &base);
         tex.set_filter(FilterMode::Linear);
-        Self { tex, rgba, geom, mesh: Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None } }
+        let rgba = base.clone();
+        Self { tex, rgba, base, geom, mesh: Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None }, seed, painted: None }
     }
 
-    fn upload(&self) {
+    /// Перерисовать срез по линии клеток, если сцена изменилась с прошлого раза.
+    fn repaint(&mut self, t: &Tissue, p: &Params, cells: &[usize], key: (u64, usize)) {
+        if self.painted == Some(key) {
+            return;
+        }
+        paint::paint_section(t, p, cells, &self.geom, &self.base, &mut self.rgba, self.seed);
         self.tex.update_from_bytes(self.geom.w as u32, self.geom.h as u32, &self.rgba);
+        self.painted = Some(key);
     }
 }
-
 pub struct Scene3D {
     material: Material,
     w: usize,
@@ -214,7 +227,10 @@ pub struct Scene3D {
     right: Face,
     pub cam: OrbitCam,
     frame: u64,
-    last_cut: Option<usize>,
+    /// Состояние, по которому сцена собрана последний раз: ревизия ткани, слой, срез.
+    last_key: Option<(u64, Option<View>, Option<usize>)>,
+    /// Время последнего update() по этапам, мс: вид клеток, меш поверхности, текстуры срезов.
+    pub timings: [f64; 3],
 }
 
 /// Точка на поверхности под курсором.
@@ -268,7 +284,8 @@ fn catmull(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
 }
 
 impl Scene3D {
-    pub fn new(w: usize, h: usize, cell_mm: f32) -> Self {
+    pub fn new(p: &Params, w: usize, h: usize) -> Self {
+        let cell_mm = p.cell_mm;
         let material = load_material(
             ShaderSource::Glsl { vertex: VERTEX, fragment: FRAGMENT },
             MaterialParams {
@@ -294,13 +311,14 @@ impl Scene3D {
             zs: vec![0.0; w * h],
             surface: Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None },
             shadow: shadow_mesh(w as f32 * cell_mm / 2.0, h as f32 * cell_mm / 2.0),
-            front: Face::new(w),
-            back: Face::new(w),
-            left: Face::new(h),
-            right: Face::new(h),
+            front: Face::new(p, w, 1),
+            back: Face::new(p, w, 2),
+            left: Face::new(p, h, 3),
+            right: Face::new(p, h, 4),
             cam: OrbitCam::atlas(),
             frame: 0,
-            last_cut: None,
+            last_key: None,
+            timings: [0.0; 3],
         }
     }
 
@@ -366,41 +384,59 @@ impl Scene3D {
         (gy + 0.5) * self.cell_mm - self.half_h()
     }
 
-    /// Пересобрать сцену по состоянию ткани. `cut` — строка сетки, через которую проходит передний срез.
-    pub fn update(&mut self, t: &Tissue, p: &Params, view: Option<View>, cut: Option<usize>) {
+    /// Пересобрать сцену по состоянию ткани. `revision` меняется при любом изменении ткани,
+    /// `cut` — строка сетки, через которую проходит передний срез. Если ничего не изменилось —
+    /// ничего не делаем.
+    pub fn update(&mut self, t: &Tissue, p: &Params, revision: u64, view: Option<View>, cut: Option<usize>) {
+        self.timings = [0.0; 3];
         self.frame += 1;
-        for i in 0..t.len() {
-            self.looks[i] = paint::cell_look(t, p, i, view);
-            self.zs[i] = paint::surface_z(t, i);
-        }
-
+        let key = (revision, view, cut);
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
         let cut_row = cut.unwrap_or(self.h - 1);
         // Координата плоскости переднего среза (в клетках): через центр строки или по краю блока.
         let gy_cut = if cut.is_some() { cut_row as f32 } else { self.h as f32 - 0.5 };
-        self.build_surface(gy_cut);
 
-        // Текстуры граней: передняя — часто, остальные — реже (там обычно здоровая ткань).
-        let cut_changed = self.last_cut != Some(cut_row);
-        if self.frame % 4 == 1 || cut_changed {
+        if self.last_key != Some(key) {
+            let t0 = std::time::Instant::now();
+            for i in 0..t.len() {
+                self.looks[i] = paint::cell_look(t, p, i, view);
+                self.zs[i] = paint::surface_z(t, i);
+            }
+            self.timings[0] = ms(t0);
+            let t1 = std::time::Instant::now();
+            self.build_surface(gy_cut);
+            self.build_faces(gy_cut);
+            self.timings[1] = ms(t1);
+        }
+
+        // Передняя грань — сразу; остальные (там обычно здоровая ткань) — по очереди в разных кадрах,
+        // чтобы не рисовать всё в одном кадре.
+        let t2 = std::time::Instant::now();
+        let face_key = (revision, cut_row);
+        // Передняя грань — раз в 3 кадра (ткань меняется плавно), при сдвиге среза — сразу.
+        let cut_moved = self.front.painted.map(|k| k.1) != Some(cut_row);
+        if cut_moved || self.frame % 3 == 0 {
             let cells: Vec<usize> = (0..self.w).map(|x| cut_row * self.w + x).collect();
-            paint::paint_section(t, p, &cells, &self.front.geom, &mut self.front.rgba, 1);
-            self.front.upload();
+            self.front.repaint(t, p, &cells, face_key);
         }
-        if self.frame % 30 == 1 || cut_changed {
-            let back: Vec<usize> = (0..self.w).map(|x| x).collect();
-            paint::paint_section(t, p, &back, &self.back.geom, &mut self.back.rgba, 2);
-            self.back.upload();
-            let left: Vec<usize> = (0..self.h).map(|y| y * self.w).collect();
-            paint::paint_section(t, p, &left, &self.left.geom, &mut self.left.rgba, 3);
-            self.left.upload();
-            let right: Vec<usize> = (0..self.h).map(|y| y * self.w + self.w - 1).collect();
-            paint::paint_section(t, p, &right, &self.right.geom, &mut self.right.rgba, 4);
-            self.right.upload();
+        match self.frame % 30 {
+            0 => {
+                let cells: Vec<usize> = (0..self.w).collect();
+                self.back.repaint(t, p, &cells, (revision, 0));
+            }
+            10 => {
+                let cells: Vec<usize> = (0..self.h).map(|y| y * self.w).collect();
+                self.left.repaint(t, p, &cells, (revision, 0));
+            }
+            20 => {
+                let cells: Vec<usize> = (0..self.h).map(|y| y * self.w + self.w - 1).collect();
+                self.right.repaint(t, p, &cells, (revision, 0));
+            }
+            _ => {}
         }
-        self.last_cut = Some(cut_row);
-        self.build_faces(gy_cut);
+        self.timings[2] = ms(t2);
+        self.last_key = Some(key);
     }
-
     /// Непрерывные координаты сетки вдоль x: от левого края блока (-0.5) до правого (w - 0.5).
     fn xs(&self) -> Vec<f32> {
         let n = self.w * SUB;
@@ -426,35 +462,40 @@ impl Scene3D {
         let xs = self.xs();
         let zs = self.zs_until(gy_cut);
         let (nx, nz) = (xs.len(), zs.len());
+        // Высоты и вершины считаются параллельно по строкам меша.
+        let this = &*self;
         let mut heights = vec![0.0f32; nx * nz];
-        for (j, &gy) in zs.iter().enumerate() {
+        heights.par_chunks_mut(nx).zip(zs.par_iter()).for_each(|(row, &gy)| {
             for (k, &gx) in xs.iter().enumerate() {
-                heights[j * nx + k] = -self.z_at(gx, gy);
+                row[k] = -this.z_at(gx, gy);
             }
-        }
+        });
         // Буфер берём из меша и возвращаем в конце, чтобы не выделять память каждый кадр.
         let mut verts = std::mem::take(&mut self.surface.vertices);
         verts.clear();
-        for (j, &gy) in zs.iter().enumerate() {
+        verts.resize(nx * nz, vertex(Vec3::ZERO, Vec2::ZERO, [0; 4], Vec4::ZERO));
+        let this = &*self;
+        verts.par_chunks_mut(nx).enumerate().for_each(|(j, out)| {
+            let gy = zs[j];
             for (k, &gx) in xs.iter().enumerate() {
                 let hl = heights[j * nx + k.saturating_sub(1)];
                 let hr = heights[j * nx + (k + 1).min(nx - 1)];
                 let hd = heights[j.saturating_sub(1) * nx + k];
                 let hu = heights[(j + 1).min(nz - 1) * nx + k];
-                let dx = (xs[(k + 1).min(nx - 1)] - xs[k.saturating_sub(1)]) * self.cell_mm;
-                let dz = (zs[(j + 1).min(nz - 1)] - zs[j.saturating_sub(1)]) * self.cell_mm;
+                let dx = (xs[(k + 1).min(nx - 1)] - xs[k.saturating_sub(1)]) * this.cell_mm;
+                let dz = (zs[(j + 1).min(nz - 1)] - zs[j.saturating_sub(1)]) * this.cell_mm;
                 let n = vec3(-(hr - hl) / dx.max(1e-4), 1.0, -(hu - hd) / dz.max(1e-4)).normalize();
-                let look = self.look_at(gx, gy);
+                let look = this.look_at(gx, gy);
                 let col = [
                     to_u8(look.albedo[0] * look.ao),
                     to_u8(look.albedo[1] * look.ao),
                     to_u8(look.albedo[2] * look.ao),
                     to_u8(look.skin),
                 ];
-                let pos = vec3(self.world_x(gx), heights[j * nx + k], self.world_z(gy));
-                verts.push(vertex(pos, vec2(0.0, 0.0), col, vec4(n.x, n.y, n.z, look.wet)));
+                let pos = vec3(this.world_x(gx), heights[j * nx + k], this.world_z(gy));
+                out[k] = vertex(pos, vec2(0.0, 0.0), col, vec4(n.x, n.y, n.z, look.wet));
             }
-        }
+        });
         self.surface.vertices = verts;
         let idx = &mut self.surface.indices;
         idx.clear();

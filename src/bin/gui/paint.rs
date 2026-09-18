@@ -4,6 +4,7 @@
 use body_sim::params::Params;
 use body_sim::report::View;
 use body_sim::tissue::Tissue;
+use rayon::prelude::*;
 
 pub type Rgb = [f32; 3];
 
@@ -333,88 +334,158 @@ fn native_layer(p: &Params, u: f32, z: f32, v: f32, seed: u32) -> Rgb {
     scale(MUSCLE, 0.82 + 0.1 * fiber + 0.06 * stria + 0.06 * grain)
 }
 
-/// Грань блока: срез по линии клеток `cells` (соседние клетки сетки, шаг `cell_mm`).
-pub fn paint_section(t: &Tissue, p: &Params, cells: &[usize], g: &SectionGeom, out: &mut [u8], seed: u32) {
-    let n = cells.len();
-    let len_mm = n as f32 * p.cell_mm;
-    for px in 0..g.w {
-        let s = ((px as f32 + 0.5) / g.w as f32 * n as f32 - 0.5).clamp(0.0, (n - 1) as f32);
-        let k0 = s.floor() as usize;
-        let k1 = (k0 + 1).min(n - 1);
-        let fs = s - k0 as f32;
-        let (i0, i1) = (cells[k0], cells[k1]);
+/// Состояние ткани в одном вертикальном столбце среза (интерполяция между клетками).
+#[derive(Clone, Copy)]
+struct Column {
+    u: f32,
+    depth: f32,
+    dmax: f32,
+    slough: f32,
+    e: f32,
+    c: f32,
+    q: f32,
+    v: f32,
+    f: f32,
+    cf: f32,
+    bl: f32,
+    nt: f32,
+    bf: f32,
+    bt: f32,
+    top: f32,
+}
+
+impl Column {
+    /// Нетронутая кожа — такой столбец берётся из готовой анатомической подложки.
+    fn intact(u: f32) -> Self {
+        Self { u, depth: 0.0, dmax: 0.0, slough: 0.0, e: 1.0, c: 1.0, q: 1.0, v: 1.0, f: 0.1, cf: 0.0, bl: 0.0, nt: 0.0, bf: 0.0, bt: 0.0, top: 0.0 }
+    }
+
+    fn is_quiet(&self) -> bool {
+        self.dmax < 0.01
+            && self.slough < 0.01
+            && self.nt < 0.02
+            && self.bt < 0.005
+            && self.e > 0.98
+            && self.top.abs() < 0.02
+            && self.v > 0.95
+    }
+
+    fn sample(t: &Tissue, i0: usize, i1: usize, fs: f32, u: f32) -> Self {
         let at = |fld: &body_sim::grid::Field| fld.data[i0] + (fld.data[i1] - fld.data[i0]) * fs;
-        let depth = at(&t.depth);
-        let dmax = at(&t.depth_max);
-        let slough = at(&t.slough);
-        let e = at(&t.epithelium);
-        let c = at(&t.collagen);
-        let q = at(&t.maturity);
-        let v = at(&t.vessels);
-        let f = at(&t.fibroblasts);
-        let cf = at(&t.clot);
-        let bl = at(&t.bleeding);
-        let nt = at(&t.neutrophils);
-        let bf = at(&t.biofilm);
-        let bt = t.bacteria_total(i0) + (t.bacteria_total(i1) - t.bacteria_total(i0)) * fs;
-        let top = surface_z(t, i0) + (surface_z(t, i1) - surface_z(t, i0)) * fs;
-        let u = (px as f32 + 0.5) / g.w as f32 * len_mm;
-
-        let ripeness = (q / 0.8).clamp(0.0, 1.0);
-        let necro = necrosis_color(slough, bt);
-        let open_top = (depth - slough).max(0.0);
-
-        for py in 0..g.h {
-            let z = (py as f32 + 0.5) / g.px_per_mm - g.top_mm;
-            let grain = fbm(u * 5.0, z * 5.0, seed + 7);
-            let mut col = if z < top - 0.02 {
-                AIR
-            } else if z < open_top {
-                // Кровь и сгусток в полости: нити фибрина.
-                let fib = smoothstep(0.55, 0.75, fbm(u * 6.0, z * 2.0, seed + 11));
-                mix(mix(CLOT, BLOOD, bl), scale(CLOT, 1.6), fib * cf)
-            } else if z < depth {
-                // Мёртвая ткань с волокнистой структурой; сверху — биоплёнка.
-                if z - open_top < 0.25 * bf {
-                    scale(BIOFILM, 0.9 + 0.2 * grain)
-                } else {
-                    let fibrous = 0.8 + 0.3 * fbm(u * 10.0, z * 3.0, seed + 13);
-                    scale(necro, fibrous)
-                }
-            } else if z < dmax {
-                // Новая ткань на месте дефекта: грануляции с петлями капилляров → рубец с параллельными волокнами.
-                let gran = (1.0 - c).clamp(0.0, 1.0);
-                if gran > 0.3 && dots(u * 8.0, z * 8.0, 0.25 * (v + f).min(1.0) * gran, 0.18, seed + 20) {
-                    CAPILLARY
-                } else {
-                    let scar = mix(SCAR_YOUNG, SCAR_OLD, ripeness);
-                    let lines = 0.5 + 0.5 * (z * 70.0 + 1.5 * grain).sin();
-                    let base = mix(GRANULATION, scar, c);
-                    scale(base, 0.9 + 0.08 * lines * c + 0.08 * grain)
-                }
-            } else {
-                native_layer(p, u, z, v, seed)
-            };
-
-            let live_top = depth.max(top);
-            if z >= live_top - 0.01 {
-                // Новый эпителий поверх заполненного дефекта.
-                if dmax > 0.05 && e > 0.05 && z - live_top < 0.1 {
-                    col = mix(col, EPI_NEW, e);
-                }
-                // Воспаление у поверхности, нейтрофилы и прорастающие бактерии.
-                let near = (1.0 - (z - live_top) / 1.8).clamp(0.0, 1.0);
-                col = mix(col, ERYTHEMA, 0.3 * (nt + bt).min(1.0) * near);
-                if dots(u * 14.0, z * 14.0, 0.5 * nt * near, 0.25, seed + 30) {
-                    col = NEUTROPHIL;
-                }
-                if dots(u * 22.0, z * 22.0, 0.8 * bt * near, 0.3, seed + 33) {
-                    col = BACTERIA;
-                }
-            } else if z >= open_top && dots(u * 22.0, z * 22.0, 0.9 * bt, 0.3, seed + 34) {
-                col = BACTERIA;
-            }
-            put(out, (py * g.w + px) * 4, col);
+        Self {
+            u,
+            depth: at(&t.depth),
+            dmax: at(&t.depth_max),
+            slough: at(&t.slough),
+            e: at(&t.epithelium),
+            c: at(&t.collagen),
+            q: at(&t.maturity),
+            v: at(&t.vessels),
+            f: at(&t.fibroblasts),
+            cf: at(&t.clot),
+            bl: at(&t.bleeding),
+            nt: at(&t.neutrophils),
+            bf: at(&t.biofilm),
+            bt: t.bacteria_total(i0) + (t.bacteria_total(i1) - t.bacteria_total(i0)) * fs,
+            top: surface_z(t, i0) + (surface_z(t, i1) - surface_z(t, i0)) * fs,
         }
     }
+}
+
+/// Цвет пикселя среза на глубине `z` (мм) в столбце `k`.
+fn section_pixel(k: &Column, p: &Params, z: f32, seed: u32) -> Rgb {
+    let u = k.u;
+    let open_top = (k.depth - k.slough).max(0.0);
+    let grain = fbm(u * 5.0, z * 5.0, seed + 7);
+    let mut col = if z < k.top - 0.02 {
+        AIR
+    } else if z < open_top {
+        // Кровь и сгусток в полости: нити фибрина.
+        let fib = smoothstep(0.55, 0.75, fbm(u * 6.0, z * 2.0, seed + 11));
+        mix(mix(CLOT, BLOOD, k.bl), scale(CLOT, 1.6), fib * k.cf)
+    } else if z < k.depth {
+        // Мёртвая ткань с волокнистой структурой; сверху — биоплёнка.
+        if z - open_top < 0.25 * k.bf {
+            scale(BIOFILM, 0.9 + 0.2 * grain)
+        } else {
+            let fibrous = 0.8 + 0.3 * fbm(u * 10.0, z * 3.0, seed + 13);
+            scale(necrosis_color(k.slough, k.bt), fibrous)
+        }
+    } else if z < k.dmax {
+        // Новая ткань на месте дефекта: грануляции с петлями капилляров → рубец с параллельными волокнами.
+        let gran = (1.0 - k.c).clamp(0.0, 1.0);
+        if gran > 0.3 && dots(u * 8.0, z * 8.0, 0.25 * (k.v + k.f).min(1.0) * gran, 0.18, seed + 20) {
+            CAPILLARY
+        } else {
+            let ripeness = (k.q / 0.8).clamp(0.0, 1.0);
+            let scar = mix(SCAR_YOUNG, SCAR_OLD, ripeness);
+            let lines = 0.5 + 0.5 * (z * 70.0 + 1.5 * grain).sin();
+            let base = mix(GRANULATION, scar, k.c);
+            scale(base, 0.9 + 0.08 * lines * k.c + 0.08 * grain)
+        }
+    } else {
+        native_layer(p, u, z, k.v, seed)
+    };
+
+    let live_top = k.depth.max(k.top);
+    if z >= live_top - 0.01 {
+        // Новый эпителий поверх заполненного дефекта.
+        if k.dmax > 0.05 && k.e > 0.05 && z - live_top < 0.1 {
+            col = mix(col, EPI_NEW, k.e);
+        }
+        // Воспаление у поверхности, нейтрофилы и прорастающие бактерии.
+        let near = (1.0 - (z - live_top) / 1.8).clamp(0.0, 1.0);
+        col = mix(col, ERYTHEMA, 0.3 * (k.nt + k.bt).min(1.0) * near);
+        if dots(u * 14.0, z * 14.0, 0.5 * k.nt * near, 0.25, seed + 30) {
+            col = NEUTROPHIL;
+        }
+        if dots(u * 22.0, z * 22.0, 0.8 * k.bt * near, 0.3, seed + 33) {
+            col = BACTERIA;
+        }
+    } else if z >= open_top && dots(u * 22.0, z * 22.0, 0.9 * k.bt, 0.3, seed + 34) {
+        col = BACTERIA;
+    }
+    col
+}
+
+/// Анатомическая подложка грани: нетронутые слои кожи. Считается один раз.
+pub fn paint_base(p: &Params, n_cells: usize, g: &SectionGeom, out: &mut [u8], seed: u32) {
+    let len_mm = n_cells as f32 * p.cell_mm;
+    out.par_chunks_mut(g.w * 4).enumerate().for_each(|(py, row)| {
+        let z = (py as f32 + 0.5) / g.px_per_mm - g.top_mm;
+        for px in 0..g.w {
+            let k = Column::intact((px as f32 + 0.5) / g.w as f32 * len_mm);
+            put(row, px * 4, section_pixel(&k, p, z, seed));
+        }
+    });
+}
+
+/// Грань блока: срез по линии клеток `cells` (соседние клетки сетки, шаг `cell_mm`).
+/// Столбцы с нетронутой тканью копируются из подложки `base`, остальные рисуются заново;
+/// строки считаются параллельно.
+pub fn paint_section(t: &Tissue, p: &Params, cells: &[usize], g: &SectionGeom, base: &[u8], out: &mut [u8], seed: u32) {
+    let n = cells.len();
+    let len_mm = n as f32 * p.cell_mm;
+    let columns: Vec<Column> = (0..g.w)
+        .map(|px| {
+            let s = ((px as f32 + 0.5) / g.w as f32 * n as f32 - 0.5).clamp(0.0, (n - 1) as f32);
+            let k0 = s.floor() as usize;
+            let k1 = (k0 + 1).min(n - 1);
+            let u = (px as f32 + 0.5) / g.w as f32 * len_mm;
+            Column::sample(t, cells[k0], cells[k1], s - k0 as f32, u)
+        })
+        .collect();
+    let quiet: Vec<bool> = columns.iter().map(Column::is_quiet).collect();
+    let row_bytes = g.w * 4;
+    out.par_chunks_mut(row_bytes).zip(base.par_chunks(row_bytes)).enumerate().for_each(|(py, (row, base_row))| {
+        let z = (py as f32 + 0.5) / g.px_per_mm - g.top_mm;
+        for px in 0..g.w {
+            let o = px * 4;
+            if quiet[px] {
+                row[o..o + 4].copy_from_slice(&base_row[o..o + 4]);
+            } else {
+                put(row, o, section_pixel(&columns[px], p, z, seed));
+            }
+        }
+    });
 }

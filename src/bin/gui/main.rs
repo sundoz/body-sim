@@ -7,6 +7,7 @@
 
 mod chart;
 mod paint;
+mod prof;
 mod render3d;
 mod ui;
 
@@ -155,12 +156,14 @@ impl App {
         let now = self.sim.hours();
         let s = &mut self.sim;
         s.therapy.apply_antiseptic_now(&mut s.tissue, self.agent, now);
+        s.touch();
     }
 
     fn debride(&mut self) {
         let now = self.sim.hours();
         let s = &mut self.sim;
         s.therapy.debride_now(&mut s.tissue, &s.p, now);
+        s.touch();
     }
 }
 
@@ -257,7 +260,7 @@ fn camera_input(ui: &Ui, app: &mut App, scene: &mut Scene3D) {
 }
 
 /// 3D-вид ткани. Возвращает клетку под курсором.
-fn draw_tissue_3d(ui: &Ui, app: &mut App, scene: &mut Scene3D) -> Option<usize> {
+fn draw_tissue_3d(ui: &Ui, app: &mut App, scene: &mut Scene3D, prof: &mut prof::Prof) -> Option<usize> {
     let r = view_rect();
     // Фон — мягкий вертикальный градиент, как в студии.
     let bands = 32;
@@ -268,15 +271,18 @@ fn draw_tissue_3d(ui: &Ui, app: &mut App, scene: &mut Scene3D) -> Option<usize> 
         draw_rectangle(r.x, y, r.w, r.h / bands as f32 + 1.0, c);
     }
 
-    scene.update(&app.sim.tissue, &app.sim.p, app.view, cut_row(app));
-    let pick = if app.orbiting { None } else { scene.pick(r, ui.mouse(), gy_limit(app)) };
+    scene.update(&app.sim.tissue, &app.sim.p, app.sim.revision, app.view, cut_row(app));
+    prof.add("сцена: вид клеток", scene.timings[0]);
+    prof.add("сцена: меши", scene.timings[1]);
+    prof.add("сцена: текстуры срезов", scene.timings[2]);
+    let pick = if app.orbiting { None } else { prof.time("выбор точки лучом", || scene.pick(r, ui.mouse(), gy_limit(app))) };
     if let Some(p) = &pick {
         if ui.mouse_down() {
             let rad = app.brush_mm / app.sim.p.cell_mm;
             app.sim.injure_disk(p.gx, p.gy, rad, app.depth_mm);
         }
     }
-    scene.draw(r, pick.as_ref(), app.brush_mm);
+    prof.time("3D: отправка на GPU", || scene.draw(r, pick.as_ref(), app.brush_mm));
 
     // Подписи слоёв у ребра среза — как выноски в атласе.
     if app.view.is_none() {
@@ -671,6 +677,7 @@ struct Opts {
     antibiotic_every: Option<f32>,
     debride: Vec<f32>,
     screenshot: Option<String>,
+    bench: Option<u32>,
 }
 
 /// Для отладки и скриншотов: `--scenario`, `--depth`, `--view`, `--no-cut`, `--top`,
@@ -690,6 +697,7 @@ fn parse_opts() -> Opts {
         antibiotic_every: None,
         debride: Vec::new(),
         screenshot: None,
+        bench: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -714,6 +722,7 @@ fn parse_opts() -> Opts {
                     "--antibiotic-every" => o.antibiotic_every = v.parse().ok(),
                     "--debride" => o.debride = v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
                     "--screenshot" => o.screenshot = Some(v),
+                    "--bench" => o.bench = v.parse().ok(),
                     _ => eprintln!("неизвестная опция: {a}"),
                 }
             }
@@ -743,7 +752,8 @@ fn window_conf() -> macroquad::conf::Conf {
 async fn main() {
     let opts = parse_opts();
     let mut ui = Ui::load();
-    ui.inert = opts.screenshot.is_some();
+    ui.inert = opts.screenshot.is_some() || opts.bench.is_some();
+    let mut prof = prof::Prof::new();
     let mut app = App::new(opts.scenario);
     app.depth_mm = opts.depth;
     app.reset();
@@ -770,7 +780,7 @@ async fn main() {
         app.playing = false;
     }
 
-    let mut scene = Scene3D::new(GRID_W, GRID_H, app.sim.p.cell_mm);
+    let mut scene = Scene3D::new(&app.sim.p, GRID_W, GRID_H);
     if opts.top {
         scene.cam = OrbitCam::top();
     }
@@ -778,7 +788,16 @@ async fn main() {
         scene.cam = OrbitCam { yaw, pitch, dist };
     }
 
+    if opts.bench.is_some() {
+        // Худший случай: максимальная скорость и курсор над раной (работает выбор точки).
+        app.speed = 10.0;
+        app.playing = true;
+        let r = view_rect();
+        ui.fake_mouse = Some(vec2(r.x + r.w * 0.45, r.y + r.h * 0.35));
+    }
+
     let mut frame = 0u32;
+    let mut frame_start = std::time::Instant::now();
     loop {
         ui.begin();
         if is_key_pressed(KeyCode::Space) {
@@ -795,13 +814,15 @@ async fn main() {
             app.sim.run_steps(n);
         }
         camera_input(&ui, &mut app, &mut scene);
-        app.update(get_frame_time());
+        let dt = if opts.bench.is_some() { 1.0 / 60.0 } else { get_frame_time() };
+        prof.time("модель", || app.update(dt));
 
         clear_background(ui::BG);
         draw_header(&ui, &app);
         let r = view_rect();
         ui::fill_rounded(Rect::new(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0), 3.0, ui::BORDER);
-        let hovered = draw_tissue_3d(&ui, &mut app, &mut scene);
+        let hovered = draw_tissue_3d(&ui, &mut app, &mut scene, &mut prof);
+        let t_ui = std::time::Instant::now();
         draw_legend_overlay(&ui, app.view);
         draw_view_chips(&ui, &mut app, &mut scene);
         let now = app.sim.hours();
@@ -817,6 +838,7 @@ async fn main() {
         if let Some(i) = hovered {
             draw_tooltip(&ui, &app, i);
         }
+        prof.add("интерфейс и график", t_ui.elapsed().as_secs_f64() * 1000.0);
 
         if let Some(path) = &opts.screenshot {
             if frame == 3 {
@@ -824,7 +846,20 @@ async fn main() {
                 break;
             }
         }
+        if let Some(n) = opts.bench {
+            if frame == n {
+                println!("{}", prof.report());
+                println!("модельных дней: {:.1}", app.sim.hours() / 24.0);
+                break;
+            }
+        }
         frame += 1;
         next_frame().await;
+        prof.add("кадр целиком (с vsync)", frame_start.elapsed().as_secs_f64() * 1000.0);
+        prof.end_frame();
+        if opts.bench.is_some() && frame == 30 {
+            prof.reset();
+        }
+        frame_start = std::time::Instant::now();
     }
 }

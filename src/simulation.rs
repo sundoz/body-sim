@@ -1,5 +1,7 @@
 //! Прогон модели во времени: ткань + лечение + почасовая история метрик.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::params::Params;
 use crate::report::Metrics;
 use crate::sim::{self, Scratch};
@@ -15,7 +17,16 @@ pub struct Simulation {
     pub history: Vec<Metrics>,
     /// Когда рана впервые эпителизировалась (часы).
     pub closed_at: Option<f32>,
+    /// Меняется при любом изменении ткани; уникальна между симуляциями —
+    /// по ней визуализация понимает, что пора перерисоваться.
+    pub revision: u64,
     scratch: Scratch,
+}
+
+static REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    REVISION.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Simulation {
@@ -30,6 +41,7 @@ impl Simulation {
             steps: 0,
             history: Vec::new(),
             closed_at: None,
+            revision: next_revision(),
         };
         s.record();
         s
@@ -47,7 +59,15 @@ impl Simulation {
         self.history.last().expect("история заполняется в new()")
     }
 
+    /// Отметить, что ткань изменилась снаружи (например, процедурой).
+    pub fn touch(&mut self) {
+        self.revision = next_revision();
+    }
+
     pub fn run_steps(&mut self, n: usize) {
+        if n > 0 {
+            self.touch();
+        }
         let per_hour = self.steps_per_hour();
         for _ in 0..n {
             let now = self.hours();
@@ -63,6 +83,7 @@ impl Simulation {
     /// Новое повреждение (например, мышью): рана снова считается открытой.
     pub fn injure_disk(&mut self, cx: f32, cy: f32, r: f32, depth_mm: f32) {
         self.tissue.injure_disk(cx, cy, r, depth_mm, &self.p);
+        self.touch();
         self.closed_at = None;
     }
 

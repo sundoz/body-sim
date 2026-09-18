@@ -19,8 +19,10 @@ pub struct Ui {
     clicked: bool,
     down: bool,
     right: bool,
-    /// Игнорировать мышь (режим скриншота).
+    /// Игнорировать мышь (режим скриншота/бенчмарка).
     pub inert: bool,
+    /// Курсор, который видит интерфейс в инертном режиме.
+    pub fake_mouse: Option<Vec2>,
 }
 
 fn load_font(paths: &[&str]) -> Option<Font> {
@@ -47,12 +49,12 @@ impl Ui {
             "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
         ])
         .or_else(|| regular.clone());
-        Self { regular, bold, mouse: Vec2::ZERO, clicked: false, down: false, right: false, inert: false }
+        Self { regular, bold, mouse: Vec2::ZERO, clicked: false, down: false, right: false, inert: false, fake_mouse: None }
     }
 
     pub fn begin(&mut self) {
         if self.inert {
-            self.mouse = vec2(-1e4, -1e4);
+            self.mouse = self.fake_mouse.unwrap_or(vec2(-1e4, -1e4));
             return;
         }
         self.mouse = mouse_position().into();

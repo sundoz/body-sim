@@ -2,7 +2,11 @@
 //! Все локальные члены читают значения клетки до её обновления,
 //! лапласианы считаются заранее по старому состоянию.
 
+use rayon::prelude::*;
+
+use crate::grid::Field;
 use crate::params::Params;
+use crate::therapy::AntisepticProps;
 use crate::tissue::Tissue;
 
 /// Буферы лапласианов, переиспользуемые между шагами.
@@ -53,45 +57,92 @@ fn hill(c: f32, mic: f32) -> f32 {
     c2 / (c2 + m2)
 }
 
-pub fn step(t: &mut Tissue, p: &Params, s: &mut Scratch) {
-    t.signal.laplacian_into(&mut s.signal);
-    t.growth_factor.laplacian_into(&mut s.gf);
-    t.vegf.laplacian_into(&mut s.vegf);
-    t.oxygen.laplacian_into(&mut s.oxygen);
-    t.bacteria.laplacian_into(&mut s.bacteria);
-    t.bacteria_res.laplacian_into(&mut s.bacteria_res);
-    t.neutrophils.laplacian_into(&mut s.neutrophils);
-    t.m1.laplacian_into(&mut s.m1);
-    t.m2.laplacian_into(&mut s.m2);
-    t.fibroblasts.laplacian_into(&mut s.fibroblasts);
-    t.vessels.laplacian_into(&mut s.vessels);
-    t.epithelium.laplacian_into(&mut s.epithelium);
+/// Сколько клеток сетки обрабатывает один поток за раз (4 строки по 96).
+const CHUNK: usize = 384;
 
-    let dt = p.dt;
+/// Изменяемые срезы всех полей ткани для одного блока клеток: блоки не пересекаются,
+/// поэтому их можно считать параллельно без блокировок.
+macro_rules! chunked_fields {
+    ($($name:ident),* $(,)?) => {
+        struct Chunk<'a> {
+            base: usize,
+            len: usize,
+            wound_mask: &'a mut [bool],
+            $($name: &'a mut [f32],)*
+        }
+
+        fn split_chunks(t: &mut Tissue, size: usize) -> Vec<Chunk<'_>> {
+            let mut wound_mask = t.wound_mask.chunks_mut(size);
+            $(let mut $name = t.$name.data.chunks_mut(size);)*
+            let mut out = Vec::new();
+            let mut base = 0;
+            while let (Some(wound_mask), $(Some($name),)*) = (wound_mask.next(), $($name.next(),)*) {
+                let len = wound_mask.len();
+                out.push(Chunk { base, len, wound_mask, $($name,)* });
+                base += len;
+            }
+            out
+        }
+    };
+}
+
+chunked_fields!(
+    antibiotic, antiseptic, bacteria, bacteria_res, biofilm, bleeding, clot, collagen, debris, depth,
+    depth_max, epithelium, fibroblasts, growth_factor, m1, m2, maturity, neutrophils, oxygen, signal,
+    slough, vegf, vessels,
+);
+
+pub fn step(t: &mut Tissue, p: &Params, s: &mut Scratch) {
+    let lap: [(&Field, &mut Vec<f32>); 12] = [
+        (&t.signal, &mut s.signal),
+        (&t.growth_factor, &mut s.gf),
+        (&t.vegf, &mut s.vegf),
+        (&t.oxygen, &mut s.oxygen),
+        (&t.bacteria, &mut s.bacteria),
+        (&t.bacteria_res, &mut s.bacteria_res),
+        (&t.neutrophils, &mut s.neutrophils),
+        (&t.m1, &mut s.m1),
+        (&t.m2, &mut s.m2),
+        (&t.fibroblasts, &mut s.fibroblasts),
+        (&t.vessels, &mut s.vessels),
+        (&t.epithelium, &mut s.epithelium),
+    ];
+    lap.into_par_iter().for_each(|(field, out)| field.laplacian_into(out));
+
     let asp = t.antiseptic_agent.props();
-    for i in 0..t.len() {
-        let bl = t.bleeding.data[i];
-        let cf = t.clot.data[i];
-        let debris = t.debris.data[i];
-        let b = t.bacteria.data[i];
-        let br = t.bacteria_res.data[i];
-        let bf = t.biofilm.data[i];
-        let depth = t.depth.data[i];
-        let dmax = t.depth_max.data[i];
-        let slough = t.slough.data[i];
-        let n = t.neutrophils.data[i];
-        let m1 = t.m1.data[i];
-        let m2 = t.m2.data[i];
-        let f = t.fibroblasts.data[i];
-        let c = t.collagen.data[i];
-        let q = t.maturity.data[i];
-        let v = t.vessels.data[i];
-        let e = t.epithelium.data[i];
-        let o = t.oxygen.data[i];
-        let sig = t.signal.data[i];
-        let g = t.growth_factor.data[i];
-        let a = t.vegf.data[i];
-        let asc = t.antiseptic.data[i];
+    let abx_plasma = t.abx_plasma;
+    let s = &*s;
+    split_chunks(t, CHUNK)
+        .into_par_iter()
+        .for_each(|mut ch| step_chunk(&mut ch, s, p, &asp, abx_plasma));
+}
+
+fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, asp: &AntisepticProps, abx_plasma: f32) {
+    let dt = p.dt;
+    for j in 0..ch.len {
+        let i = ch.base + j;
+        let bl = ch.bleeding[j];
+        let cf = ch.clot[j];
+        let debris = ch.debris[j];
+        let b = ch.bacteria[j];
+        let br = ch.bacteria_res[j];
+        let bf = ch.biofilm[j];
+        let depth = ch.depth[j];
+        let dmax = ch.depth_max[j];
+        let slough = ch.slough[j];
+        let n = ch.neutrophils[j];
+        let m1 = ch.m1[j];
+        let m2 = ch.m2[j];
+        let f = ch.fibroblasts[j];
+        let c = ch.collagen[j];
+        let q = ch.maturity[j];
+        let v = ch.vessels[j];
+        let e = ch.epithelium[j];
+        let o = ch.oxygen[j];
+        let sig = ch.signal[j];
+        let g = ch.growth_factor[j];
+        let a = ch.vegf[j];
+        let asc = ch.antiseptic[j];
 
         let bt = b + br;
         let wounded = dmax > 0.05;
@@ -118,7 +169,7 @@ pub fn step(t: &mut Tissue, p: &Params, s: &mut Scratch) {
         // с плохой перфузией он почти не попадает.
         let bed_blood = if wounded { 0.5 * bq } else { 0.0 };
         let perf_local = (v + bed_blood).min(1.0) * p.perfusion * (1.0 - block);
-        let abx = t.abx_plasma * perf_local;
+        let abx = abx_plasma * perf_local;
         let abx_shield = 1.0 - p.abx_biofilm_protect * bf;
         let abx_kill_s = p.abx_emax * hill(abx, p.mic_sensitive) * abx_shield;
         let abx_kill_r = p.abx_emax * hill(abx, p.mic_resistant) * abx_shield;
@@ -225,33 +276,33 @@ pub fn step(t: &mut Tissue, p: &Params, s: &mut Scratch) {
             - asp.cytotox * asc * e;
 
         // --- Запись.
-        t.bleeding.data[i] = (bl + dt * d_bleed).clamp(0.0, 1.0);
-        t.clot.data[i] = (cf + dt * d_clot).clamp(0.0, 1.0);
-        t.debris.data[i] = (debris + dt * d_debris).max(0.0);
+        ch.bleeding[j] = (bl + dt * d_bleed).clamp(0.0, 1.0);
+        ch.clot[j] = (cf + dt * d_clot).clamp(0.0, 1.0);
+        ch.debris[j] = (debris + dt * d_debris).max(0.0);
         let b_new = (b + dt * d_bact).max(0.0);
-        t.bacteria.data[i] = if b_new < 1e-5 { 0.0 } else { b_new };
+        ch.bacteria[j] = if b_new < 1e-5 { 0.0 } else { b_new };
         let br_new = (br + dt * d_bact_res).max(0.0);
-        t.bacteria_res.data[i] = if br_new < 1e-9 { 0.0 } else { br_new };
-        t.biofilm.data[i] = (bf + dt * d_biofilm).clamp(0.0, 1.0);
-        t.oxygen.data[i] = (o + dt * d_o2).clamp(0.0, 1.0);
-        t.signal.data[i] = (sig + dt * d_sig).max(0.0);
-        t.growth_factor.data[i] = (g + dt * d_gf).max(0.0);
-        t.vegf.data[i] = (a + dt * d_vegf).max(0.0);
-        t.neutrophils.data[i] = (n + dt * d_neut).max(0.0);
-        t.m1.data[i] = (m1 + dt * d_m1).max(0.0);
-        t.m2.data[i] = (m2 + dt * d_m2).max(0.0);
-        t.fibroblasts.data[i] = ((f + dt * d_fib) * (1.0 - dt * death)).max(0.0);
-        t.vessels.data[i] = ((v + dt * d_vessel) * (1.0 - dt * death)).clamp(0.0, 1.0);
-        t.epithelium.data[i] = ((e + dt * d_epi) * (1.0 - dt * death)).clamp(0.0, 1.0);
-        t.antibiotic.data[i] = abx;
+        ch.bacteria_res[j] = if br_new < 1e-9 { 0.0 } else { br_new };
+        ch.biofilm[j] = (bf + dt * d_biofilm).clamp(0.0, 1.0);
+        ch.oxygen[j] = (o + dt * d_o2).clamp(0.0, 1.0);
+        ch.signal[j] = (sig + dt * d_sig).max(0.0);
+        ch.growth_factor[j] = (g + dt * d_gf).max(0.0);
+        ch.vegf[j] = (a + dt * d_vegf).max(0.0);
+        ch.neutrophils[j] = (n + dt * d_neut).max(0.0);
+        ch.m1[j] = (m1 + dt * d_m1).max(0.0);
+        ch.m2[j] = (m2 + dt * d_m2).max(0.0);
+        ch.fibroblasts[j] = ((f + dt * d_fib) * (1.0 - dt * death)).max(0.0);
+        ch.vessels[j] = ((v + dt * d_vessel) * (1.0 - dt * death)).clamp(0.0, 1.0);
+        ch.epithelium[j] = ((e + dt * d_epi) * (1.0 - dt * death)).clamp(0.0, 1.0);
+        ch.antibiotic[j] = abx;
 
         let slough_new = (slough + dt * (dead_mm - autolysis)).max(0.0);
         let depth_new = (depth + dt * (dead_mm - fill)).clamp(0.0, p.max_depth_mm).max(slough_new);
-        t.slough.data[i] = slough_new;
-        t.depth.data[i] = depth_new;
-        t.depth_max.data[i] = dmax.max(depth_new);
+        ch.slough[j] = slough_new;
+        ch.depth[j] = depth_new;
+        ch.depth_max[j] = dmax.max(depth_new);
         if slough_new > 0.3 || depth_new > 0.3 {
-            t.wound_mask[i] = true;
+            ch.wound_mask[j] = true;
         }
 
         // --- Коллаген и ремоделирование: новый коллаген незрелый (тип III),
@@ -262,7 +313,7 @@ pub fn step(t: &mut Tissue, p: &Params, s: &mut Scratch) {
         let mut q_new = if c_new > 1e-6 { (mature / c_new).min(1.0) } else { 0.0 };
         let cap = p.scar_maturity_cap + (1.0 - p.scar_maturity_cap) * p.residual_dermis(dmax);
         q_new += dt * p.maturation_rate * (cap - q_new).max(0.0) / (1.0 + 5.0 * m1);
-        t.collagen.data[i] = c_new;
-        t.maturity.data[i] = q_new;
+        ch.collagen[j] = c_new;
+        ch.maturity[j] = q_new;
     }
 }

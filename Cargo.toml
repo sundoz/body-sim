@@ -19,6 +19,7 @@ path = "src/bin/gui/main.rs"
 
 [dependencies]
 macroquad = { version = "0.4.16", default-features = false }
+rayon = "1.12.0"
 
 [profile.release]
 debug = false
