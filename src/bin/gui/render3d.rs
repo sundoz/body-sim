@@ -400,7 +400,7 @@ impl Scene3D {
             let t0 = std::time::Instant::now();
             for i in 0..t.len() {
                 self.looks[i] = paint::cell_look(t, p, i, view);
-                self.zs[i] = paint::surface_z(t, i);
+                self.zs[i] = paint::surface_z(t, p, i);
             }
             self.timings[0] = ms(t0);
             let t1 = std::time::Instant::now();
@@ -654,5 +654,37 @@ impl Scene3D {
     pub fn front_edge_point(&self, right: bool, gy_cut: f32, depth_mm: f32) -> Vec3 {
         let gx = if right { self.w as f32 - 0.5 } else { -0.5 };
         vec3(self.world_x(gx), -depth_mm, self.world_z(gy_cut))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catmull_passes_through_control_points() {
+        assert!((catmull(0.0, 1.0, 3.0, 4.0, 0.0) - 1.0).abs() < 1e-6);
+        assert!((catmull(0.0, 1.0, 3.0, 4.0, 1.0) - 3.0).abs() < 1e-6);
+        assert!((catmull(2.0, 2.0, 2.0, 2.0, 0.37) - 2.0).abs() < 1e-6, "константа остаётся константой");
+        let mid = catmull(0.0, 1.0, 2.0, 3.0, 0.5);
+        assert!((mid - 1.5).abs() < 1e-6, "прямая остаётся прямой");
+    }
+
+    #[test]
+    fn orbit_camera_looks_at_the_block() {
+        for cam in [OrbitCam::atlas(), OrbitCam::top()] {
+            let d = (cam.position() - OrbitCam::target()).length();
+            assert!((d - cam.dist).abs() < 1e-3);
+            assert!(cam.position().y > OrbitCam::target().y, "камера над блоком");
+        }
+    }
+
+    #[test]
+    fn shadow_is_darkest_under_the_block() {
+        let m = shadow_mesh(12.0, 6.0);
+        let center = m.vertices.iter().min_by(|a, b| a.position.length().total_cmp(&b.position.length())).unwrap();
+        let corner = m.vertices.iter().max_by(|a, b| a.position.length().total_cmp(&b.position.length())).unwrap();
+        assert!(center.color[3] > 100 && corner.color[3] == 0);
+        assert!(m.vertices.iter().all(|v| (v.position.y + BLOCK_DEPTH).abs() < 0.1));
     }
 }

@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use body_sim::params::Scenario;
 use body_sim::report::{self, Condition, Metrics, Phase, View};
 use body_sim::simulation::Simulation;
-use body_sim::therapy::Antiseptic;
+use body_sim::therapy::{Antibiotic, Antiseptic, Debrider};
 use body_sim::tissue::WoundShape;
 
 const HELP: &str = "\
@@ -22,9 +22,12 @@ body-sim — симулятор заживления кожной раны (ко
                    5 жировая клетчатка, 9 мышца                (2.5)
 
 Лечение:
-  --antiseptic <a>        octenidine | chlorhexidine | povidone | peroxide
+  --antiseptic <a>        octenidine | polyhexanide | hypochlorous |
+                          chlorhexidine | povidone | peroxide
   --antiseptic-every <ч>  интервал перевязок                  (24)
-  --antibiotic-every <ч>  курс антибиотика, доза каждые N часов
+  --antibiotic-every <ч>  курс цефазолина, доза каждые N часов
+  --antibiotics <список>  несколько препаратов: cefazolin:8,clindamycin:8,vancomycin:12
+  --debriders <список>    очищение от некроза: hydrogel,collagenase,larvae
   --treat-from <день>     когда начать лечение                (0)
   --debride <дни>         хирургическая обработка, напр. 3,10
 
@@ -33,7 +36,7 @@ body-sim — симулятор заживления кожной раны (ко
   --every <n>      печатать срез каждые n дней                (2)
   --view <поле>    что рисовать на карте                      (integrity)
                    integrity, strength, epithelium, collagen, vessels, oxygen,
-                   clot, depth, necrosis, bacteria, resistant, biofilm,
+                   clot, depth, necrosis, bacteria, resistant, biofilm, toxin,
                    neutrophils, macrophages, fibroblasts, antiseptic, antibiotic
   --no-map         не рисовать карты, только цифры
   --csv <файл>     записать почасовую динамику в CSV
@@ -48,7 +51,8 @@ struct Cli {
     depth_mm: f32,
     antiseptic: Option<Antiseptic>,
     antiseptic_every: f32,
-    antibiotic_every: Option<f32>,
+    antibiotics: Vec<(Antibiotic, f32)>,
+    debriders: Vec<Debrider>,
     treat_from: f32,
     debride: Vec<f32>,
     days: f32,
@@ -60,7 +64,7 @@ struct Cli {
     h: usize,
 }
 
-fn parse_args() -> Result<Option<Cli>, String> {
+fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Option<Cli>, String> {
     let mut cli = Cli {
         scenario: Scenario::Healthy,
         wound: "circle".into(),
@@ -68,7 +72,8 @@ fn parse_args() -> Result<Option<Cli>, String> {
         depth_mm: 2.5,
         antiseptic: None,
         antiseptic_every: 24.0,
-        antibiotic_every: None,
+        antibiotics: Vec::new(),
+        debriders: Vec::new(),
         treat_from: 0.0,
         debride: Vec::new(),
         days: 28.0,
@@ -79,7 +84,7 @@ fn parse_args() -> Result<Option<Cli>, String> {
         w: 96,
         h: 48,
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = argv.into_iter();
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or_else(|| format!("для {a} нужно значение"));
         match a.as_str() {
@@ -104,7 +109,20 @@ fn parse_args() -> Result<Option<Cli>, String> {
                     Some(Antiseptic::parse(&v).ok_or_else(|| format!("неизвестный антисептик: {v}"))?);
             }
             "--antiseptic-every" => cli.antiseptic_every = num(&val()?)?,
-            "--antibiotic-every" => cli.antibiotic_every = Some(num(&val()?)?),
+            "--antibiotic-every" => cli.antibiotics.push((Antibiotic::Cefazolin, num(&val()?)?)),
+            "--antibiotics" => {
+                for item in val()?.split(',') {
+                    let (name, every) = item.split_once(':').ok_or("формат --antibiotics: cefazolin:8")?;
+                    let drug = Antibiotic::parse(name.trim()).ok_or_else(|| format!("неизвестный антибиотик: {name}"))?;
+                    cli.antibiotics.push((drug, num(every.trim())?));
+                }
+            }
+            "--debriders" => {
+                for name in val()?.split(',') {
+                    cli.debriders
+                        .push(Debrider::parse(name.trim()).ok_or_else(|| format!("неизвестный метод очищения: {name}"))?);
+                }
+            }
             "--treat-from" => cli.treat_from = val()?.parse().map_err(|_| "--treat-from: ожидалось число")?,
             "--debride" => {
                 cli.debride = val()?
@@ -157,7 +175,7 @@ impl Peak {
 }
 
 fn main() -> ExitCode {
-    let cli = match parse_args() {
+    let cli = match parse_args(std::env::args().skip(1)) {
         Ok(Some(c)) => c,
         Ok(None) => {
             print!("{HELP}");
@@ -213,8 +231,11 @@ fn main() -> ExitCode {
     if let Some(a) = cli.antiseptic {
         plan.push(format!("{} каждые {:.0} ч", a.title(), cli.antiseptic_every));
     }
-    if let Some(h) = cli.antibiotic_every {
-        plan.push(format!("антибиотик каждые {h:.0} ч"));
+    for (drug, h) in &cli.antibiotics {
+        plan.push(format!("{} каждые {h:.0} ч", drug.title()));
+    }
+    for d in &cli.debriders {
+        plan.push(d.title().to_lowercase());
     }
     if !plan.is_empty() {
         println!("Лечение с {:.1} дня: {}", cli.treat_from, plan.join(", "));
@@ -242,8 +263,11 @@ fn main() -> ExitCode {
             if let Some(a) = cli.antiseptic {
                 sim.therapy.start_antiseptic(a, cli.antiseptic_every, hours);
             }
-            if let Some(every) = cli.antibiotic_every {
-                sim.therapy.start_antibiotic(every, hours);
+            for (drug, every) in &cli.antibiotics {
+                sim.therapy.start_antibiotic(*drug, *every, hours);
+            }
+            for d in &cli.debriders {
+                sim.tissue.debriders[d.index()] = true;
             }
         }
         while debride_idx < cli.debride.len() && hours >= cli.debride[debride_idx] * 24.0 {
@@ -310,6 +334,22 @@ fn main() -> ExitCode {
         last.resistant_fraction * 100.0,
         last.biofilm
     );
+    if last.lost_fat_mm > 0.0 {
+        println!(
+            "  Клетчатка: утрачено {:.1} мм, вернулось жиром {:.0}% — остальное фиброзный рубец",
+            last.lost_fat_mm,
+            last.fat_regen * 100.0
+        );
+    }
+    if last.lost_muscle_mm > 0.0 {
+        println!(
+            "  Мышца: утрачено {:.1} мм, новые волокна {:.0}%, фиброз {:.0}%, ещё не заполнено {:.0}%",
+            last.lost_muscle_mm,
+            last.muscle_regen * 100.0,
+            last.muscle_fibrosis * 100.0,
+            (1.0 - last.muscle_regen - last.muscle_fibrosis).max(0.0) * 100.0
+        );
+    }
     println!(
         "  Прочность рубца: {:.0}% от здоровой кожи (коллаген {:.2}, зрелость {:.2})",
         last.strength * 100.0,
@@ -320,4 +360,86 @@ fn main() -> ExitCode {
         println!("  CSV: {path}");
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Option<Cli>, String> {
+        parse_args(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn defaults() {
+        let cli = parse(&[]).unwrap().unwrap();
+        assert_eq!(cli.scenario, Scenario::Healthy);
+        assert_eq!(cli.depth_mm, 2.5);
+        assert_eq!(cli.days, 28.0);
+        assert!(cli.antibiotics.is_empty() && cli.debriders.is_empty() && cli.antiseptic.is_none());
+        assert!(cli.map);
+    }
+
+    #[test]
+    fn help() {
+        assert!(parse(&["--help"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn full_treatment_plan() {
+        let cli = parse(&[
+            "--scenario",
+            "necrotizing",
+            "--depth",
+            "5",
+            "--antiseptic",
+            "phmb",
+            "--antibiotic-every",
+            "8",
+            "--antibiotics",
+            "clindamycin:8, vancomycin:12",
+            "--debriders",
+            "larvae,hydrogel",
+            "--debride",
+            "0.5, 3",
+            "--treat-from",
+            "0.5",
+            "--no-map",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(cli.scenario, Scenario::Necrotizing);
+        assert_eq!(cli.antiseptic, Some(Antiseptic::Polyhexanide));
+        assert_eq!(
+            cli.antibiotics,
+            vec![(Antibiotic::Cefazolin, 8.0), (Antibiotic::Clindamycin, 8.0), (Antibiotic::Vancomycin, 12.0)]
+        );
+        assert_eq!(cli.debriders, vec![Debrider::Larvae, Debrider::Hydrogel]);
+        assert_eq!(cli.debride, vec![0.5, 3.0]);
+        assert_eq!(cli.treat_from, 0.5);
+        assert!(!cli.map);
+    }
+
+    #[test]
+    fn grid_and_view() {
+        let cli = parse(&["--grid", "40x20", "--view", "toxin"]).unwrap().unwrap();
+        assert_eq!((cli.w, cli.h), (40, 20));
+        assert_eq!(cli.view, View::Toxin);
+    }
+
+    #[test]
+    fn errors_are_reported() {
+        for bad in [
+            vec!["--scenario", "zombie"],
+            vec!["--antibiotics", "aspirin:8"],
+            vec!["--antibiotics", "cefazolin"],
+            vec!["--debriders", "leeches"],
+            vec!["--depth", "-1"],
+            vec!["--days"],
+            vec!["--grid", "40"],
+            vec!["--wat"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?} должно быть ошибкой");
+        }
+    }
 }

@@ -1,3 +1,4 @@
+use crate::params::Params;
 use crate::tissue::Tissue;
 
 /// Показатели раны: средние по её области плюс площади по всему участку.
@@ -28,7 +29,20 @@ pub struct Metrics {
     pub epithelium: f32,
     pub strength: f32,
     pub integrity: f32,
+    /// Суммарная концентрация антибиотиков в плазме (в МПК чувствительного штамма).
     pub abx_plasma: f32,
+    /// Площадь раны в начале наблюдения (заполняет `Simulation`) — чтобы видеть, что рана разрастается.
+    pub initial_wound_mm2: f32,
+    /// По каждому антибиотику (по `Antibiotic::index`).
+    pub abx: [f32; 3],
+    /// Утраченная толщина мышцы и клетчатки (максимум по ране), мм.
+    pub lost_muscle_mm: f32,
+    pub lost_fat_mm: f32,
+    /// Какая доля утраченной мышцы стала новыми волокнами / рубцом (взвешено по объёму).
+    pub muscle_regen: f32,
+    pub muscle_fibrosis: f32,
+    /// Какая доля утраченной клетчатки вернулась жиром.
+    pub fat_regen: f32,
 }
 
 /// Порог бактериальной нагрузки, выше которого ткань считается инфицированной.
@@ -37,8 +51,10 @@ const INFECTED: f32 = 0.2;
 const NECROTIC: f32 = 0.2;
 
 impl Metrics {
-    pub fn measure(t: &Tissue, hours: f32, cell_mm: f32) -> Self {
-        let mut m = Metrics { hours, abx_plasma: t.abx_plasma, ..Default::default() };
+    pub fn measure(t: &Tissue, p: &Params, hours: f32) -> Self {
+        let cell_mm = p.cell_mm;
+        let mut m = Metrics { hours, abx: t.abx_plasma, abx_plasma: t.abx_plasma.iter().sum(), ..Default::default() };
+        let (mut mus_w, mut fat_w) = (0.0f32, 0.0f32);
         let area = cell_mm * cell_mm;
         let mut count = 0usize;
         let mut open = 0usize;
@@ -53,7 +69,20 @@ impl Metrics {
             if t.slough.data[i] > NECROTIC {
                 m.necrotic_mm2 += area;
             }
-            m.depth_max = m.depth_max.max(t.depth_max.data[i]);
+            let dmax = t.depth_max.data[i];
+            m.depth_max = m.depth_max.max(dmax);
+            let (lm, lf) = (p.lost_muscle_mm(dmax), p.lost_fat_mm(dmax));
+            if lm > 0.0 {
+                m.lost_muscle_mm = m.lost_muscle_mm.max(lm);
+                m.muscle_regen += t.myo.data[i] * lm;
+                m.muscle_fibrosis += t.muscle_scar.data[i] * lm;
+                mus_w += lm;
+            }
+            if lf > 0.0 {
+                m.lost_fat_mm = m.lost_fat_mm.max(lf);
+                m.fat_regen += t.fat_new.data[i] * lf;
+                fat_w += lf;
+            }
             if !t.wound_mask[i] {
                 continue;
             }
@@ -101,6 +130,13 @@ impl Metrics {
         ] {
             *x *= k;
         }
+        if mus_w > 0.0 {
+            m.muscle_regen /= mus_w;
+            m.muscle_fibrosis /= mus_w;
+        }
+        if fat_w > 0.0 {
+            m.fat_regen /= fat_w;
+        }
         m.wound_mm2 = count as f32 * area;
         m.open_fraction = open as f32 * k;
         m.open_mm2 = open as f32 * area;
@@ -125,7 +161,9 @@ impl Metrics {
     pub fn condition(&self) -> Condition {
         if self.infected_mm2 > 150.0 {
             Condition::Sepsis
-        } else if self.infected_mm2 > 1.2 * self.wound_mm2 + 10.0 {
+        } else if self.infected_mm2 > 1.2 * self.wound_mm2 + 10.0
+            || (self.wound_mm2 > 1.5 * self.initial_wound_mm2 + 10.0 && self.infected_mm2 > 0.5 * self.wound_mm2)
+        {
             Condition::Spreading
         } else if self.necrotic_mm2 > 3.0 && self.necrotic_mm2 > 0.25 * self.wound_mm2 {
             Condition::Necrosis
@@ -138,11 +176,11 @@ impl Metrics {
         }
     }
 
-    pub const CSV_HEADER: &'static str = "hours,day,phase,condition,wound_mm2,open_fraction,open_mm2,depth,depth_max,necrotic_mm2,infected_mm2,bacteria,resistant_fraction,biofilm,abx_plasma,bleeding,clot,debris,neutrophils,m1,m2,fibroblasts,collagen,maturity,vessels,oxygen,epithelium,strength,integrity";
+    pub const CSV_HEADER: &'static str = "hours,day,phase,condition,wound_mm2,open_fraction,open_mm2,depth,depth_max,necrotic_mm2,infected_mm2,bacteria,resistant_fraction,biofilm,abx_plasma,lost_muscle_mm,muscle_regen,muscle_fibrosis,lost_fat_mm,fat_regen,bleeding,clot,debris,neutrophils,m1,m2,fibroblasts,collagen,maturity,vessels,oxygen,epithelium,strength,integrity";
 
     pub fn csv_row(&self) -> String {
         format!(
-            "{:.1},{:.3},{},{},{:.2},{:.4},{:.3},{:.3},{:.3},{:.2},{:.2},{:.4},{:.4},{:.4},{:.3},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
+            "{:.1},{:.3},{},{},{:.2},{:.4},{:.3},{:.3},{:.3},{:.2},{:.2},{:.4},{:.4},{:.4},{:.3},{:.2},{:.4},{:.4},{:.2},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
             self.hours,
             self.hours / 24.0,
             self.phase().key(),
@@ -158,6 +196,11 @@ impl Metrics {
             self.resistant_fraction,
             self.biofilm,
             self.abx_plasma,
+            self.lost_muscle_mm,
+            self.muscle_regen,
+            self.muscle_fibrosis,
+            self.lost_fat_mm,
+            self.fat_regen,
             self.bleeding,
             self.clot,
             self.debris,
@@ -254,6 +297,7 @@ pub enum View {
     Bacteria,
     Resistant,
     Biofilm,
+    Toxin,
     Neutrophils,
     Macrophages,
     Fibroblasts,
@@ -262,9 +306,9 @@ pub enum View {
 }
 
 impl View {
-    pub const NAMES: &'static str = "integrity, strength, epithelium, collagen, vessels, oxygen, clot, depth, necrosis, bacteria, resistant, biofilm, neutrophils, macrophages, fibroblasts, antiseptic, antibiotic";
+    pub const NAMES: &'static str = "integrity, strength, epithelium, collagen, vessels, oxygen, clot, depth, necrosis, bacteria, resistant, biofilm, toxin, neutrophils, macrophages, fibroblasts, antiseptic, antibiotic";
 
-    pub const ALL: [View; 17] = [
+    pub const ALL: [View; 18] = [
         Self::Integrity,
         Self::Strength,
         Self::Epithelium,
@@ -277,6 +321,7 @@ impl View {
         Self::Bacteria,
         Self::Resistant,
         Self::Biofilm,
+        Self::Toxin,
         Self::Neutrophils,
         Self::Macrophages,
         Self::Fibroblasts,
@@ -298,6 +343,7 @@ impl View {
             "bacteria" => Self::Bacteria,
             "resistant" => Self::Resistant,
             "biofilm" => Self::Biofilm,
+            "toxin" => Self::Toxin,
             "neutrophils" => Self::Neutrophils,
             "macrophages" => Self::Macrophages,
             "fibroblasts" => Self::Fibroblasts,
@@ -321,6 +367,7 @@ impl View {
             Self::Bacteria => "Бактерии",
             Self::Resistant => "Устойчивые",
             Self::Biofilm => "Биоплёнка",
+            Self::Toxin => "Токсины",
             Self::Neutrophils => "Нейтрофилы",
             Self::Macrophages => "Макрофаги",
             Self::Fibroblasts => "Фибробласты",
@@ -335,6 +382,7 @@ impl View {
             Self::Depth => "5 мм",
             Self::Necrosis => "2 мм",
             Self::Antibiotic => "8 МПК",
+            Self::Toxin => "3",
             _ => "1",
         }
     }
@@ -354,6 +402,7 @@ impl View {
             Self::Bacteria => t.bacteria_total(i),
             Self::Resistant => t.bacteria_res.data[i],
             Self::Biofilm => t.biofilm.data[i],
+            Self::Toxin => t.toxin.data[i] / 3.0,
             Self::Neutrophils => t.neutrophils.data[i],
             Self::Macrophages => t.m1.data[i] + t.m2.data[i],
             Self::Fibroblasts => t.fibroblasts.data[i],
@@ -426,7 +475,150 @@ pub fn print_snapshot(m: &Metrics, map: Option<&str>) {
         "  эпителий {:.2} | коллаген {:.2} (зрелость {:.2}) | прочность {:.2} | целостность {:.2}",
         m.epithelium, m.collagen, m.maturity, m.strength, m.integrity
     );
+    if m.lost_fat_mm > 0.0 {
+        let mut line = format!("  клетчатка: утрачено {:.1} мм, вернулось жиром {:.0}%", m.lost_fat_mm, m.fat_regen * 100.0);
+        if m.lost_muscle_mm > 0.0 {
+            line += &format!(
+                " | мышца: утрачено {:.1} мм, новые волокна {:.0}%, фиброз {:.0}%",
+                m.lost_muscle_mm,
+                m.muscle_regen * 100.0,
+                m.muscle_fibrosis * 100.0
+            );
+        }
+        println!("{line}");
+    }
     if let Some(map) = map {
         println!("{map}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tissue::WoundShape;
+
+    #[test]
+    fn healthy_skin_has_no_wound() {
+        let p = Params::default();
+        let t = Tissue::healthy(96, 48, &p);
+        let m = Metrics::measure(&t, &p, 0.0);
+        assert_eq!(m.wound_mm2, 0.0);
+        assert_eq!(m.infected_mm2, 0.0);
+        assert_eq!(m.necrotic_mm2, 0.0);
+        assert_eq!(m.lost_fat_mm, 0.0);
+        assert_eq!(m.condition(), Condition::Healed);
+    }
+
+    #[test]
+    fn fresh_wound_metrics() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(96, 48, &p);
+        t.injure(WoundShape::Circle { radius: 16.0 }, 9.0, &p);
+        let m = Metrics::measure(&t, &p, 0.0);
+        let area = std::f32::consts::PI * 4.0 * 4.0;
+        assert!((m.wound_mm2 - area).abs() / area < 0.05);
+        assert!((m.open_fraction - 1.0).abs() < 1e-6);
+        assert!((m.depth_max - 9.0).abs() < 1e-5);
+        assert!((m.lost_fat_mm - 6.0).abs() < 1e-4);
+        assert!((m.lost_muscle_mm - 0.6).abs() < 1e-4);
+        assert_eq!(m.muscle_regen, 0.0);
+        assert_eq!(m.phase(), Phase::Hemostasis);
+        assert_eq!(m.condition(), Condition::Healing);
+    }
+
+    #[test]
+    fn condition_classification() {
+        let base = Metrics { wound_mm2: 50.0, initial_wound_mm2: 50.0, open_fraction: 0.8, hours: 24.0, ..Default::default() };
+        let with = |f: &dyn Fn(&mut Metrics)| {
+            let mut m = base.clone();
+            f(&mut m);
+            m.condition()
+        };
+        assert_eq!(with(&|_| {}), Condition::Healing);
+        assert_eq!(with(&|m| m.infected_mm2 = 200.0), Condition::Sepsis);
+        assert_eq!(with(&|m| m.infected_mm2 = 80.0), Condition::Spreading);
+        assert_eq!(with(&|m| m.infected_mm2 = 50.0), Condition::Healing, "инфекция в пределах раны — не распространение");
+        assert_eq!(with(&|m| m.necrotic_mm2 = 20.0), Condition::Necrosis);
+        assert_eq!(
+            with(&|m| {
+                m.wound_mm2 = 120.0;
+                m.infected_mm2 = 110.0;
+            }),
+            Condition::Spreading,
+            "рана разрастается за счёт инфекции"
+        );
+        assert_eq!(
+            with(&|m| {
+                m.wound_mm2 = 120.0;
+                m.infected_mm2 = 5.0;
+            }),
+            Condition::Healing,
+            "рану расширила хирургия, инфекции уже нет"
+        );
+        assert_eq!(with(&|m| m.open_fraction = 0.0), Condition::Healed);
+        assert_eq!(with(&|m| m.hours = 31.0 * 24.0), Condition::Chronic);
+        assert_eq!(with(&|m| m.biofilm = 0.6), Condition::Chronic);
+        assert!(Condition::Sepsis > Condition::Necrosis && Condition::Necrosis > Condition::Healing);
+    }
+
+    #[test]
+    fn phases() {
+        let m = |f: &dyn Fn(&mut Metrics)| {
+            let mut m = Metrics { open_fraction: 0.5, collagen: 0.2, ..Default::default() };
+            f(&mut m);
+            m.phase()
+        };
+        assert_eq!(m(&|m| m.bleeding = 0.5), Phase::Hemostasis);
+        assert_eq!(m(&|m| m.neutrophils = 0.5), Phase::Inflammation);
+        assert_eq!(m(&|m| m.fibroblasts = 0.5), Phase::Proliferation);
+        assert_eq!(
+            m(&|m| {
+                m.open_fraction = 0.0;
+                m.collagen = 0.8;
+            }),
+            Phase::Remodeling
+        );
+    }
+
+    #[test]
+    fn csv_row_matches_header() {
+        let row = Metrics::default().csv_row();
+        assert_eq!(row.split(',').count(), Metrics::CSV_HEADER.split(',').count());
+    }
+
+    #[test]
+    fn every_view_parses_and_is_normalized() {
+        let names: Vec<&str> = View::NAMES.split(", ").collect();
+        assert_eq!(names.len(), View::ALL.len());
+        let p = Params::default();
+        let t = Tissue::healthy(8, 8, &p);
+        for (name, v) in names.iter().zip(View::ALL) {
+            assert_eq!(View::parse(name), Some(v), "{name}");
+            assert!(!v.title().is_empty());
+            let x = v.value(&t, 0);
+            assert!((0.0..=1.0).contains(&x), "{name}: {x}");
+        }
+    }
+
+    #[test]
+    fn resistant_share_is_hidden_for_negligible_population() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(96, 48, &p);
+        t.bacteria_res.data[0] = 1e-4;
+        assert_eq!(Metrics::measure(&t, &p, 0.0).resistant_fraction, 0.0);
+        for i in 0..200 {
+            t.bacteria.data[i] = 0.5;
+            t.bacteria_res.data[i] = 0.5;
+        }
+        assert!((Metrics::measure(&t, &p, 0.0).resistant_fraction - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn ascii_map_has_frame() {
+        let p = Params::default();
+        let t = Tissue::healthy(10, 4, &p);
+        let map = render_map(&t, View::Integrity);
+        assert_eq!(map.lines().count(), 4, "две строки сетки на строку терминала + рамка");
+        assert!(map.lines().nth(1).unwrap().contains("@@@@"));
     }
 }

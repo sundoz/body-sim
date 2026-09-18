@@ -88,10 +88,60 @@ impl Simulation {
     }
 
     fn record(&mut self) {
-        let m = Metrics::measure(&self.tissue, self.hours(), self.p.cell_mm);
+        let mut m = Metrics::measure(&self.tissue, &self.p, self.hours());
+        m.initial_wound_mm2 = self.history.first().map_or(m.wound_mm2, |f| f.initial_wound_mm2);
         if self.closed_at.is_none() && self.steps > 0 && m.open_fraction < 0.01 {
             self.closed_at = Some(self.hours());
         }
         self.history.push(m);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::params::Scenario;
+
+    fn sim(depth: f32) -> Simulation {
+        let p = Scenario::Healthy.params();
+        Simulation::new(p, 96, 48, WoundShape::Circle { radius: 16.0 }, depth)
+    }
+
+    #[test]
+    fn history_is_hourly() {
+        let mut s = sim(2.5);
+        assert_eq!(s.history.len(), 1);
+        s.run_steps(25 * s.steps_per_hour());
+        assert_eq!(s.history.len(), 26);
+        for (k, m) in s.history.iter().enumerate() {
+            assert!((m.hours - k as f32).abs() < 1e-3);
+        }
+        assert!((s.hours() - 25.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn revision_tracks_every_change() {
+        let mut s = sim(2.5);
+        let r0 = s.revision;
+        s.run_steps(0);
+        assert_eq!(s.revision, r0, "без шагов ткань не менялась");
+        s.run_steps(1);
+        let r1 = s.revision;
+        assert_ne!(r1, r0);
+        s.injure_disk(10.0, 10.0, 3.0, 1.0);
+        assert_ne!(s.revision, r1);
+        let r2 = s.revision;
+        s.touch();
+        assert_ne!(s.revision, r2);
+        assert_ne!(sim(2.5).revision, sim(2.5).revision, "у разных симуляций разные ревизии");
+    }
+
+    #[test]
+    fn superficial_wound_closes_within_a_week_and_new_injury_reopens_it() {
+        let mut s = sim(0.1);
+        s.run_steps(7 * 24 * s.steps_per_hour());
+        assert!(s.closed_at.is_some());
+        s.injure_disk(48.0, 24.0, 4.0, 1.0);
+        assert!(s.closed_at.is_none());
     }
 }

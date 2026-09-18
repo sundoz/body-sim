@@ -101,7 +101,7 @@ pub fn condition_color(c: Condition) -> Color {
 pub fn event_color(k: EventKind) -> Color {
     match k {
         EventKind::Antiseptic => Color::new(0.35, 0.80, 0.95, 1.0),
-        EventKind::Dose => Color::new(1.00, 0.60, 0.20, 1.0),
+        EventKind::Dose(_) => Color::new(1.00, 0.60, 0.20, 1.0),
         EventKind::Debridement => Color::new(1.0, 1.0, 1.0, 1.0),
     }
 }
@@ -170,7 +170,7 @@ pub fn draw(ui: &Ui, r: Rect, hist: &[Metrics], events: &[Event], visible: &mut 
         let (h, th) = match ev.kind {
             EventKind::Debridement => (plot.h, 1.5),
             EventKind::Antiseptic => (10.0, 2.0),
-            EventKind::Dose => (6.0, 1.0),
+            EventKind::Dose(_) => (6.0, 1.0),
         };
         let mut c = event_color(ev.kind);
         if ev.kind == EventKind::Debridement {
@@ -235,5 +235,43 @@ fn draw_chip(ui: &Ui, chip: Rect, i: usize, visible: &mut [bool; N]) {
     ui.text(NAMES[i], chip.x + 19.0, chip.y + 14.0, 12, if on { ui::TEXT } else { ui::MUTED });
     if ui.clicked_in(chip) {
         visible[i] = !visible[i];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn series_are_normalized() {
+        let m = Metrics {
+            open_fraction: 0.5,
+            depth: 2.5,
+            necrotic_mm2: 10.0,
+            wound_mm2: 50.0,
+            abx_plasma: 5.0,
+            strength: 0.4,
+            ..Default::default()
+        };
+        assert_eq!(value(0, &m), 0.5);
+        assert!((value(1, &m) - 0.5).abs() < 1e-6, "глубина 2.5 из 5 мм");
+        assert!((value(2, &m) - 0.2).abs() < 1e-6, "некроз — доля площади раны");
+        assert!((value(13, &m) - 0.5).abs() < 1e-6);
+        assert_eq!(value_label(12, &m), "40%");
+        assert_eq!(NAMES.len(), N);
+        assert_eq!(COLORS.len(), N);
+        assert_eq!(DEFAULT_VISIBLE.len(), N);
+    }
+
+    #[test]
+    fn every_phase_and_condition_has_a_distinct_color() {
+        let phases = [Phase::Hemostasis, Phase::Inflammation, Phase::Proliferation, Phase::Remodeling];
+        for (i, a) in phases.iter().enumerate() {
+            for b in &phases[i + 1..] {
+                assert_ne!(phase_color(*a), phase_color(*b));
+            }
+        }
+        assert_ne!(condition_color(Condition::Healed), condition_color(Condition::Sepsis));
+        assert_eq!(event_color(EventKind::Dose(body_sim::therapy::Antibiotic::Cefazolin)), event_color(EventKind::Dose(body_sim::therapy::Antibiotic::Vancomycin)));
     }
 }

@@ -3,6 +3,7 @@
 
 use body_sim::params::Params;
 use body_sim::report::View;
+use body_sim::therapy::Debrider;
 use body_sim::tissue::Tissue;
 use rayon::prelude::*;
 
@@ -42,6 +43,8 @@ const CAPILLARY: Rgb = rgb(170, 20, 30);
 const BACTERIA: Rgb = rgb(118, 172, 48);
 const NEUTROPHIL: Rgb = rgb(110, 64, 160);
 const AIR: Rgb = rgb(14, 14, 18);
+const LARVA: Rgb = rgb(236, 226, 196);
+const FIBROSIS: Rgb = rgb(226, 206, 196);
 
 pub const LEGEND: [(&str, Rgb); 12] = [
     ("Кожа", SKIN),
@@ -177,13 +180,17 @@ pub struct CellLook {
 }
 
 /// Глубина видимой поверхности (мм вниз от уровня кожи; отрицательная — отёк).
-pub fn surface_z(t: &Tissue, i: usize) -> f32 {
+/// На месте невосстановленной клетчатки и фиброзной мышцы зажившая рана остаётся вдавленной.
+pub fn surface_z(t: &Tissue, p: &Params, i: usize) -> f32 {
     let e = t.epithelium.data[i];
     let open = (t.depth.data[i] - t.slough.data[i]).max(0.0);
     // Свежая рана залита кровью, потом сгустком.
     let fill = ((t.bleeding.data[i] + t.clot.data[i] * (1.0 - e)) * 0.9).min(0.9);
     let inflamed = (0.8 * t.neutrophils.data[i] + t.bacteria_total(i)).min(1.0) * e;
-    open * (1.0 - fill) - 0.25 * inflamed
+    let dmax = t.depth_max.data[i];
+    let healed = (1.0 - t.depth.data[i] / 0.3).clamp(0.0, 1.0) * t.collagen.data[i];
+    let missing = p.lost_fat_mm(dmax) * (1.0 - t.fat_new.data[i]) + 0.5 * p.lost_muscle_mm(dmax) * t.muscle_scar.data[i];
+    open * (1.0 - fill) - 0.25 * inflamed + p.atrophy * missing * healed
 }
 
 fn bed_color(p: &Params, dmax: f32) -> Rgb {
@@ -197,16 +204,18 @@ fn bed_color(p: &Params, dmax: f32) -> Rgb {
 }
 
 /// Мёртвая ткань: влажный жёлтый слаф при инфекции, сухой чёрный струп при ишемии.
-fn necrosis_color(slough: f32, bacteria: f32) -> Rgb {
-    mix(SLOUGH, ESCHAR, necrosis_dryness(slough, bacteria))
+/// Под гидрогелем струп размягчается и светлеет.
+fn necrosis_color(slough: f32, bacteria: f32, moist: bool) -> Rgb {
+    mix(SLOUGH, ESCHAR, necrosis_dryness(slough, bacteria, moist))
 }
 
-fn necrosis_dryness(slough: f32, bacteria: f32) -> f32 {
-    (slough / 1.2).min(1.0) * (1.0 - 0.7 * bacteria.min(1.0))
+fn necrosis_dryness(slough: f32, bacteria: f32, moist: bool) -> f32 {
+    (slough / 1.2).min(1.0) * (1.0 - 0.7 * bacteria.min(1.0)) * if moist { 0.3 } else { 1.0 }
 }
 
 pub fn cell_look(t: &Tissue, p: &Params, i: usize, view: Option<View>) -> CellLook {
-    let depth_vis = surface_z(t, i).max(0.0);
+    let depth_vis = surface_z(t, p, i).max(0.0);
+    let moist = t.debriders[Debrider::Hydrogel.index()];
     let ao = 1.0 - 0.06 * depth_vis.min(7.0);
     if let Some(v) = view {
         return CellLook { albedo: colormap(v.value(t, i)), wet: 0.25, skin: 0.0, ao };
@@ -237,7 +246,7 @@ pub fn cell_look(t: &Tissue, p: &Params, i: usize, view: Option<View>) -> CellLo
     col = mix(col, CLOT, cf * open * 0.85 * (1.0 - sat(slough, 0.3)));
     col = mix(col, BLOOD, bl);
     let necro = sat(slough, 0.25) * 1.1;
-    col = mix(col, necrosis_color(slough, bt), necro);
+    col = mix(col, necrosis_color(slough, bt, moist), necro);
     col = mix(col, BIOFILM, 0.5 * bf * open);
     let exudate = ((2.0 * bt).min(1.0) * 0.6 + 0.1 * n) * open;
     col = mix(col, EXUDATE, exudate.min(0.7));
@@ -246,7 +255,7 @@ pub fn cell_look(t: &Tissue, p: &Params, i: usize, view: Option<View>) -> CellLo
     }
 
     // Влажность: открытая рана мокрая, кровь и биоплёнка блестят, сухой струп — матовый.
-    let dry = necrosis_dryness(slough, bt) * necro.min(1.0);
+    let dry = necrosis_dryness(slough, bt, moist) * necro.min(1.0);
     let mut wet = 0.12 * e + open * 0.75;
     wet = wet.max(bl).max(bf * open).max(asc * 0.9).max(0.35 * e * (1.0 - c * ripeness));
     wet *= 1.0 - 0.9 * dry;
@@ -352,12 +361,17 @@ struct Column {
     bf: f32,
     bt: f32,
     top: f32,
+    myo: f32,
+    mscar: f32,
+    fat_new: f32,
+    moist: bool,
+    larvae: bool,
 }
 
 impl Column {
     /// Нетронутая кожа — такой столбец берётся из готовой анатомической подложки.
     fn intact(u: f32) -> Self {
-        Self { u, depth: 0.0, dmax: 0.0, slough: 0.0, e: 1.0, c: 1.0, q: 1.0, v: 1.0, f: 0.1, cf: 0.0, bl: 0.0, nt: 0.0, bf: 0.0, bt: 0.0, top: 0.0 }
+        Self { u, depth: 0.0, dmax: 0.0, slough: 0.0, e: 1.0, c: 1.0, q: 1.0, v: 1.0, f: 0.1, cf: 0.0, bl: 0.0, nt: 0.0, bf: 0.0, bt: 0.0, top: 0.0, myo: 0.0, mscar: 0.0, fat_new: 0.0, moist: false, larvae: false }
     }
 
     fn is_quiet(&self) -> bool {
@@ -370,7 +384,7 @@ impl Column {
             && self.v > 0.95
     }
 
-    fn sample(t: &Tissue, i0: usize, i1: usize, fs: f32, u: f32) -> Self {
+    fn sample(t: &Tissue, p: &Params, i0: usize, i1: usize, fs: f32, u: f32) -> Self {
         let at = |fld: &body_sim::grid::Field| fld.data[i0] + (fld.data[i1] - fld.data[i0]) * fs;
         Self {
             u,
@@ -387,7 +401,12 @@ impl Column {
             nt: at(&t.neutrophils),
             bf: at(&t.biofilm),
             bt: t.bacteria_total(i0) + (t.bacteria_total(i1) - t.bacteria_total(i0)) * fs,
-            top: surface_z(t, i0) + (surface_z(t, i1) - surface_z(t, i0)) * fs,
+            top: surface_z(t, p, i0) + (surface_z(t, p, i1) - surface_z(t, p, i0)) * fs,
+            myo: at(&t.myo),
+            mscar: at(&t.muscle_scar),
+            fat_new: at(&t.fat_new),
+            moist: t.debriders[Debrider::Hydrogel.index()],
+            larvae: t.debriders[Debrider::Larvae.index()],
         }
     }
 }
@@ -397,7 +416,7 @@ fn section_pixel(k: &Column, p: &Params, z: f32, seed: u32) -> Rgb {
     let u = k.u;
     let open_top = (k.depth - k.slough).max(0.0);
     let grain = fbm(u * 5.0, z * 5.0, seed + 7);
-    let mut col = if z < k.top - 0.02 {
+    let col = if z < k.top - 0.02 {
         AIR
     } else if z < open_top {
         // Кровь и сгусток в полости: нити фибрина.
@@ -407,26 +426,55 @@ fn section_pixel(k: &Column, p: &Params, z: f32, seed: u32) -> Rgb {
         // Мёртвая ткань с волокнистой структурой; сверху — биоплёнка.
         if z - open_top < 0.25 * k.bf {
             scale(BIOFILM, 0.9 + 0.2 * grain)
+        } else if k.larvae && dots(u * 7.0, z * 12.0, 0.35, 0.3, seed + 15) {
+            LARVA
         } else {
             let fibrous = 0.8 + 0.3 * fbm(u * 10.0, z * 3.0, seed + 13);
-            scale(necrosis_color(k.slough, k.bt), fibrous)
+            scale(necrosis_color(k.slough, k.bt, k.moist), fibrous)
+        }
+    } else if z < k.dmax && z >= p.fat_bottom_mm() + 0.3 && k.myo + k.mscar > 0.01 {
+        // Там, где была мышца: дольки новых волокон, фиброз и ещё не созревшие грануляции.
+        let sel = vnoise(u / 1.6, z / 0.5, seed + 91);
+        if sel < k.myo {
+            scale(native_layer(p, u, z, 1.0, seed), 1.08)
+        } else if sel < k.myo + k.mscar {
+            scale(FIBROSIS, 0.92 + 0.08 * (0.5 + 0.5 * (z * 60.0 + 2.0 * grain).sin()))
+        } else {
+            new_scar_tissue(k, u, z, grain, seed)
+        }
+    } else if z < k.dmax && z >= p.skin_bottom_mm() && z < p.fat_bottom_mm() && k.fat_new > 0.01 {
+        // Там, где была клетчатка: вернулись лишь отдельные жировые дольки, остальное — рубец.
+        if vnoise(u / 0.75, z / 0.75, seed + 90) < k.fat_new {
+            native_layer(p, u, z, 1.0, seed)
+        } else {
+            new_scar_tissue(k, u, z, grain, seed)
         }
     } else if z < k.dmax {
-        // Новая ткань на месте дефекта: грануляции с петлями капилляров → рубец с параллельными волокнами.
-        let gran = (1.0 - k.c).clamp(0.0, 1.0);
-        if gran > 0.3 && dots(u * 8.0, z * 8.0, 0.25 * (k.v + k.f).min(1.0) * gran, 0.18, seed + 20) {
-            CAPILLARY
-        } else {
-            let ripeness = (k.q / 0.8).clamp(0.0, 1.0);
-            let scar = mix(SCAR_YOUNG, SCAR_OLD, ripeness);
-            let lines = 0.5 + 0.5 * (z * 70.0 + 1.5 * grain).sin();
-            let base = mix(GRANULATION, scar, k.c);
-            scale(base, 0.9 + 0.08 * lines * k.c + 0.08 * grain)
-        }
+        new_scar_tissue(k, u, z, grain, seed)
     } else {
         native_layer(p, u, z, k.v, seed)
     };
+    overlay_cells(k, z, col, seed)
+}
 
+/// Новая ткань на месте дефекта: грануляции с петлями капилляров → рубец с параллельными волокнами.
+fn new_scar_tissue(k: &Column, u: f32, z: f32, grain: f32, seed: u32) -> Rgb {
+    let gran = (1.0 - k.c).clamp(0.0, 1.0);
+    if gran > 0.3 && dots(u * 8.0, z * 8.0, 0.25 * (k.v + k.f).min(1.0) * gran, 0.18, seed + 20) {
+        CAPILLARY
+    } else {
+        let ripeness = (k.q / 0.8).clamp(0.0, 1.0);
+        let scar = mix(SCAR_YOUNG, SCAR_OLD, ripeness);
+        let lines = 0.5 + 0.5 * (z * 70.0 + 1.5 * grain).sin();
+        let base = mix(GRANULATION, scar, k.c);
+        scale(base, 0.9 + 0.08 * lines * k.c + 0.08 * grain)
+    }
+}
+
+/// Поверх ткани: новый эпителий, воспаление, нейтрофилы и бактерии у поверхности.
+fn overlay_cells(k: &Column, z: f32, mut col: Rgb, seed: u32) -> Rgb {
+    let u = k.u;
+    let open_top = (k.depth - k.slough).max(0.0);
     let live_top = k.depth.max(k.top);
     if z >= live_top - 0.01 {
         // Новый эпителий поверх заполненного дефекта.
@@ -472,7 +520,7 @@ pub fn paint_section(t: &Tissue, p: &Params, cells: &[usize], g: &SectionGeom, b
             let k0 = s.floor() as usize;
             let k1 = (k0 + 1).min(n - 1);
             let u = (px as f32 + 0.5) / g.w as f32 * len_mm;
-            Column::sample(t, cells[k0], cells[k1], s - k0 as f32, u)
+            Column::sample(t, p, cells[k0], cells[k1], s - k0 as f32, u)
         })
         .collect();
     let quiet: Vec<bool> = columns.iter().map(Column::is_quiet).collect();
@@ -488,4 +536,128 @@ pub fn paint_section(t: &Tissue, p: &Params, cells: &[usize], g: &SectionGeom, b
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use body_sim::tissue::WoundShape;
+
+    const W: usize = 48;
+    const H: usize = 24;
+
+    fn geom(cells: usize) -> SectionGeom {
+        SectionGeom { w: cells * 4, h: 120, top_mm: 1.0, px_per_mm: 9.0 }
+    }
+
+    fn row(t: &Tissue, y: usize) -> Vec<usize> {
+        (0..t.w).map(|x| y * t.w + x).collect()
+    }
+
+    #[test]
+    fn colormap_spans_dark_to_light() {
+        let lum = |c: Rgb| c[0] + c[1] + c[2];
+        assert!(lum(colormap(0.0)) < 0.2);
+        assert!(lum(colormap(1.0)) > 2.4);
+        assert_eq!(colormap(-5.0), colormap(0.0));
+        assert_eq!(colormap(5.0), colormap(1.0));
+        assert!(lum(colormap(0.3)) < lum(colormap(0.7)));
+    }
+
+    #[test]
+    fn noise_is_bounded_and_deterministic() {
+        for k in 0..200 {
+            let (x, y) = (k as f32 * 0.37, k as f32 * 0.91);
+            let v = fbm(x, y, 3);
+            assert!((0.0..=1.0).contains(&v));
+            assert_eq!(v, fbm(x, y, 3));
+            let (d1, d2) = worley(x, y, 5);
+            assert!(d1 <= d2);
+        }
+    }
+
+    #[test]
+    fn surface_of_healthy_skin_is_flat() {
+        let p = Params::default();
+        let t = Tissue::healthy(W, H, &p);
+        assert!(surface_z(&t, &p, 0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fresh_wound_is_filled_with_blood_and_healed_fat_defect_is_depressed() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(W, H, &p);
+        t.injure(WoundShape::Circle { radius: 6.0 }, 5.0, &p);
+        let c = (H / 2) * W + W / 2;
+        let fresh = surface_z(&t, &p, c);
+        assert!(fresh > 0.0 && fresh < 1.0, "полость залита кровью: {fresh}");
+        // «Зажившая» клетка: полость заполнена, коллаген есть, жир не вернулся.
+        t.depth.data[c] = 0.0;
+        t.bleeding.data[c] = 0.0;
+        t.clot.data[c] = 0.0;
+        t.collagen.data[c] = 1.0;
+        t.epithelium.data[c] = 1.0;
+        t.bacteria.data[c] = 0.0; // иначе поверхность чуть приподнимет воспалительный отёк
+        let dip = surface_z(&t, &p, c);
+        assert!((dip - p.atrophy * p.lost_fat_mm(5.0)).abs() < 1e-4, "вдавленный рубец: {dip}");
+        t.fat_new.data[c] = 1.0;
+        assert!(surface_z(&t, &p, c).abs() < 1e-4, "жир вернулся — вдавления нет");
+    }
+
+    #[test]
+    fn looks_of_skin_wound_and_eschar() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(W, H, &p);
+        let skin = cell_look(&t, &p, 0, None);
+        assert!(skin.skin > 0.99 && skin.wet < 0.2);
+        t.injure(WoundShape::Circle { radius: 6.0 }, 2.5, &p);
+        let c = (H / 2) * W + W / 2;
+        let wound = cell_look(&t, &p, c, None);
+        assert!(wound.wet > 0.9 && wound.skin == 0.0, "свежая рана мокрая, без пор");
+        t.bleeding.data[c] = 0.0;
+        t.slough.data[c] = 2.0;
+        let eschar = cell_look(&t, &p, c, None);
+        assert!(eschar.wet < 0.3, "сухой струп матовый");
+        t.debriders[Debrider::Hydrogel.index()] = true;
+        assert!(cell_look(&t, &p, c, None).wet > eschar.wet, "гидрогель размягчает струп");
+        let heat = cell_look(&t, &p, c, Some(View::Necrosis));
+        assert_eq!(heat.albedo, colormap(1.0));
+    }
+
+    #[test]
+    fn section_of_healthy_skin_is_the_anatomy_base() {
+        let p = Params::default();
+        let t = Tissue::healthy(W, H, &p);
+        let g = geom(W);
+        let mut base = vec![0u8; g.w * g.h * 4];
+        paint_base(&p, W, &g, &mut base, 1);
+        let mut out = vec![0u8; base.len()];
+        paint_section(&t, &p, &row(&t, H / 2), &g, &base, &mut out, 1);
+        assert_eq!(out, base, "нетронутая кожа копируется из подложки");
+        // Слои по глубине: воздух над кожей, жир в клетчатке, мышца внизу.
+        let px = |z_mm: f32| {
+            let py = ((z_mm + g.top_mm) * g.px_per_mm) as usize;
+            let o = (py * g.w + g.w / 2) * 4;
+            [base[o], base[o + 1], base[o + 2]]
+        };
+        assert!(px(-0.5).iter().all(|&v| v < 30), "над кожей — воздух");
+        assert!(px(5.0)[1] > 150, "клетчатка жёлтая");
+        let muscle = px(10.5);
+        assert!(muscle[0] > muscle[1] && muscle[0] > muscle[2], "мышца красная");
+    }
+
+    #[test]
+    fn wound_columns_are_repainted() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(W, H, &p);
+        t.injure(WoundShape::Circle { radius: 6.0 }, 5.0, &p);
+        let g = geom(W);
+        let mut base = vec![0u8; g.w * g.h * 4];
+        paint_base(&p, W, &g, &mut base, 1);
+        let mut out = vec![0u8; base.len()];
+        paint_section(&t, &p, &row(&t, H / 2), &g, &base, &mut out, 1);
+        let col = |buf: &[u8], x: usize| (0..g.h).map(|y| buf[(y * g.w + x) * 4]).collect::<Vec<_>>();
+        assert_eq!(col(&out, 0), col(&base, 0), "край среза — здоровая кожа");
+        assert_ne!(col(&out, g.w / 2), col(&base, g.w / 2), "в центре — рана");
+    }
 }

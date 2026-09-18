@@ -21,6 +21,10 @@ path = "src/bin/gui/main.rs"
 macroquad = { version = "0.4.16", default-features = false }
 rayon = "1.12.0"
 
+# Тесты гоняют клинические сценарии по 40–60 модельных дней — без оптимизаций это слишком долго.
+[profile.test]
+opt-level = 3
+
 [profile.release]
 debug = false
 lto = "thin"

@@ -89,6 +89,12 @@ pub struct Params {
     pub toxin_threshold: f32,
     /// Толщина ткани (мм), погибающая за единицу «смертности».
     pub necrosis_depth_mm: f32,
+    /// Экзотоксины (стрептолизин, α-токсин): выработка на единицу бактерий, 1/ч; 0 — штамм их не выделяет.
+    pub toxin_production: f32,
+    pub d_toxin: f32,
+    pub toxin_decay: f32,
+    /// Гибель ткани на единицу концентрации токсина, 1/ч.
+    pub k_toxin_field: f32,
     pub slough_clear: f32,
     pub max_depth_mm: f32,
 
@@ -140,13 +146,24 @@ pub struct Params {
     /// До какой остаточной глубины полости эпителий может наползать.
     pub epi_level_mm: f32,
 
-    // Антибиотик (системный, условный β-лактам)
-    pub abx_half_life_h: f32,
-    pub abx_dose: f32,
-    pub abx_emax: f32,
-    pub mic_sensitive: f32,
-    pub mic_resistant: f32,
-    pub abx_biofilm_protect: f32,
+    // Регенерация глубоких слоёв
+    /// Скорость образования новых мышечных волокон из клеток-сателлитов, 1/ч.
+    pub muscle_regen: f32,
+    /// Характерная глубина потери мышцы (мм), при которой способность к регенерации падает в e раз:
+    /// большие дефекты (volumetric muscle loss) не восстанавливаются, а рубцуются.
+    pub muscle_loss_scale: f32,
+    /// Скорость фиброза мышцы при большом дефекте, воспалении, инфекции, ишемии, 1/ч.
+    pub muscle_fibrosis: f32,
+    /// Скорость появления новых адипоцитов (зависит от уцелевших фолликулов), 1/ч.
+    pub fat_regen: f32,
+    /// Какая доля невосстановленной клетчатки остаётся вдавлением после заживления.
+    pub atrophy: f32,
+
+    // Очищение от некроза (мм мёртвой ткани в час)
+    pub hydrogel_boost: f32,
+    pub collagenase_rate: f32,
+    pub larvae_rate: f32,
+    pub larvae_kill: f32,
 }
 
 impl Default for Params {
@@ -221,6 +238,10 @@ impl Default for Params {
             k_toxin: 0.03,
             toxin_threshold: 0.8,
             necrosis_depth_mm: 0.5,
+            toxin_production: 0.0,
+            d_toxin: 0.3,
+            toxin_decay: 0.3,
+            k_toxin_field: 0.15,
             slough_clear: 0.01,
             max_depth_mm: 12.0,
 
@@ -263,12 +284,18 @@ impl Default for Params {
             adnexal_rate: 0.002,
             epi_level_mm: 0.4,
 
-            abx_half_life_h: 2.0,
-            abx_dose: 8.0,
-            abx_emax: 0.6,
-            mic_sensitive: 1.0,
-            mic_resistant: 4.0,
-            abx_biofilm_protect: 0.9,
+            // Небольшая травма: 50% новых волокон к ~10-му дню, ~90% к 3–4 неделям.
+            muscle_regen: 0.01,
+            muscle_loss_scale: 2.5,
+            muscle_fibrosis: 0.004,
+            // Жир во взрослой ране почти не возвращается: несколько процентов за месяц.
+            fat_regen: 0.00015,
+            atrophy: 0.35,
+
+            hydrogel_boost: 2.5,
+            collagenase_rate: 0.004,
+            larvae_rate: 0.012,
+            larvae_kill: 0.2,
         }
     }
 }
@@ -308,6 +335,16 @@ impl Params {
     /// Доля уцелевшей дермы (с фолликулами и сосудами) под раной глубиной `depth_mm`.
     pub fn residual_dermis(&self, depth_mm: f32) -> f32 {
         (1.0 - (depth_mm - self.epidermis_mm) / self.dermis_mm).clamp(0.0, 1.0)
+    }
+
+    /// Сколько миллиметров жировой клетчатки утрачено в колонке с поражением до dmax.
+    pub fn lost_fat_mm(&self, dmax: f32) -> f32 {
+        dmax.clamp(self.skin_bottom_mm(), self.fat_bottom_mm()) - self.skin_bottom_mm()
+    }
+
+    /// Сколько миллиметров мышцы утрачено (ниже клетчатки и фасции).
+    pub fn lost_muscle_mm(&self, dmax: f32) -> f32 {
+        (dmax - self.fat_bottom_mm() - 0.3).max(0.0)
     }
 
     /// Название слоя на глубине `depth_mm`.
@@ -420,6 +457,8 @@ impl Scenario {
                 p.bact_invasion = 0.35;
                 p.d_bact = 0.1;
                 p.leukocidin = 4.0;
+                // Токсины расходятся впереди бактерий и убивают ткань, которую те потом заселяют.
+                p.toxin_production = 1.0;
                 p.k_toxin = 0.12;
                 p.toxin_threshold = 0.25;
             }
@@ -438,4 +477,87 @@ fn diabetic(p: &mut Params) {
     p.switch_m1_m2 *= 0.35;
     p.gf_m2 *= 0.6;
     p.prolif_fib *= 0.7;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn layer_boundaries() {
+        let p = Params::default();
+        assert!(close(p.skin_bottom_mm(), 2.1));
+        assert!(close(p.fat_bottom_mm(), 8.1));
+    }
+
+    #[test]
+    fn bed_perfusion_follows_layers() {
+        let p = Params::default();
+        assert!(close(p.bed_perfusion(0.0), 1.0));
+        assert!(close(p.bed_perfusion(1.5), 1.0), "дерма хорошо кровоснабжается");
+        assert!(close(p.bed_perfusion(5.0), p.fat_bed_perfusion), "клетчатка — плохо");
+        assert!(close(p.bed_perfusion(11.0), p.muscle_bed_perfusion), "мышца — снова хорошо");
+        assert!(p.bed_perfusion(5.0) < p.bed_perfusion(1.0));
+        assert!(p.bed_perfusion(11.0) > p.bed_perfusion(5.0));
+    }
+
+    #[test]
+    fn residual_dermis_shrinks_with_depth() {
+        let p = Params::default();
+        assert!(close(p.residual_dermis(0.0), 1.0));
+        assert!(close(p.residual_dermis(0.1), 1.0));
+        assert!(close(p.residual_dermis(1.1), 0.5));
+        assert!(close(p.residual_dermis(2.1), 0.0));
+        assert!(close(p.residual_dermis(9.0), 0.0));
+    }
+
+    #[test]
+    fn lost_layers() {
+        let p = Params::default();
+        assert!(close(p.lost_fat_mm(1.0), 0.0));
+        assert!(close(p.lost_fat_mm(5.0), 2.9));
+        assert!(close(p.lost_fat_mm(12.0), 6.0));
+        assert!(close(p.lost_muscle_mm(8.0), 0.0));
+        assert!(close(p.lost_muscle_mm(9.0), 0.6));
+    }
+
+    #[test]
+    fn layer_titles() {
+        let p = Params::default();
+        assert_eq!(p.layer_title(0.1), "эпидермис");
+        assert_eq!(p.layer_title(1.0), "дерма (пограничная)");
+        assert_eq!(p.layer_title(2.5), "полнослойная");
+        assert_eq!(p.layer_title(5.0), "жировая клетчатка");
+        assert_eq!(p.layer_title(9.0), "мышца");
+    }
+
+    #[test]
+    fn scenarios_parse_and_change_the_patient() {
+        let keys = ["healthy", "diabetic", "infected", "elderly", "ischemic", "diabetic-foot", "necrotizing"];
+        for (key, s) in keys.iter().zip(Scenario::ALL) {
+            assert_eq!(Scenario::parse(key), Some(s));
+            assert!(!s.title().is_empty() && !s.short().is_empty());
+        }
+        assert_eq!(Scenario::parse("unknown"), None);
+        let healthy = Scenario::Healthy.params();
+        assert!(Scenario::Ischemic.params().perfusion < 0.5 * healthy.perfusion);
+        assert!(Scenario::Diabetic.params().perfusion < healthy.perfusion);
+        assert!(Scenario::Infected.params().initial_bacteria > healthy.initial_bacteria);
+        let nf = Scenario::Necrotizing.params();
+        assert!(nf.leukocidin > 0.0 && nf.bact_invasion > 0.0 && nf.k_toxin > healthy.k_toxin);
+    }
+
+    #[test]
+    fn explicit_scheme_is_stable() {
+        // Явная схема устойчива при D·dt ≤ 0.25 (5-точечный лапласиан).
+        let p = Params::default();
+        for d in [p.d_signal, p.d_gf, p.d_vegf, p.d_o2, p.d_bact, p.d_neut, p.d_mac, p.d_fib, p.d_vessel, p.d_epi] {
+            assert!(d * p.dt <= 0.25, "D = {d}");
+        }
+        assert!(Scenario::Necrotizing.params().d_bact * p.dt <= 0.25);
+    }
 }

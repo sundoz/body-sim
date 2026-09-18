@@ -49,10 +49,22 @@ pub struct Tissue {
     pub antiseptic: Field,
     /// Концентрация антибиотика в ткани (в единицах МПК чувствительного штамма).
     pub antibiotic: Field,
+    /// Бактериальные экзотоксины.
+    pub toxin: Field,
+
+    // Что выросло на месте утраченных глубоких слоёв (доли от утраченного объёма слоя)
+    /// Новые мышечные волокна.
+    pub myo: Field,
+    /// Фиброз (рубец) в мышце.
+    pub muscle_scar: Field,
+    /// Вернувшаяся жировая ткань; остальное — фиброзный рубец.
+    pub fat_new: Field,
 
     pub antiseptic_agent: Antiseptic,
-    /// Концентрация антибиотика в плазме.
-    pub abx_plasma: f32,
+    /// Концентрации антибиотиков в плазме (по Antibiotic::index).
+    pub abx_plasma: [f32; 3],
+    /// Включённые методы очищения от некроза (по Debrider::index).
+    pub debriders: [bool; 3],
 
     /// Клетки сетки, относящиеся к ране (растёт при некрозе).
     pub wound_mask: Vec<bool>,
@@ -95,8 +107,13 @@ impl Tissue {
             vegf: f(0.0),
             antiseptic: f(0.0),
             antibiotic: f(0.0),
+            toxin: f(0.0),
+            myo: f(0.0),
+            muscle_scar: f(0.0),
+            fat_new: f(0.0),
             antiseptic_agent: Antiseptic::Octenidine,
-            abx_plasma: 0.0,
+            abx_plasma: [0.0; 3],
+            debriders: [false; 3],
             wound_mask: vec![false; w * h],
         }
     }
@@ -159,7 +176,19 @@ impl Tissue {
         }
         let d = a * depth_mm;
         self.depth.data[i] = self.depth.data[i].max(d);
-        self.depth_max.data[i] = self.depth_max.data[i].max(d);
+        let old = self.depth_max.data[i];
+        let new = old.max(d);
+        self.depth_max.data[i] = new;
+        // Восстановленная часть глубоких слоёв теперь приходится на больший объём дефекта.
+        let (mo, mn) = (p.lost_muscle_mm(old), p.lost_muscle_mm(new));
+        if mn > mo {
+            self.myo.data[i] *= mo / mn;
+            self.muscle_scar.data[i] *= mo / mn;
+        }
+        let (fo, fnew) = (p.lost_fat_mm(old), p.lost_fat_mm(new));
+        if fnew > fo {
+            self.fat_new.data[i] *= fo / fnew;
+        }
 
         let lost = a * (1.0 - p.residual_dermis(depth_mm));
         let keep = 1.0 - lost;
@@ -191,5 +220,89 @@ impl Tissue {
     pub fn integrity(&self, i: usize) -> f32 {
         let cavity = 1.0 / (1.0 + self.depth.data[i]);
         (0.35 * self.epithelium.data[i] + 0.45 * self.strength(i) + 0.2 * self.vessels.data[i]) * cavity
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const W: usize = 96;
+    const H: usize = 48;
+
+    fn center() -> usize {
+        (H / 2) * W + W / 2
+    }
+
+    #[test]
+    fn healthy_tissue_is_intact() {
+        let p = Params::default();
+        let t = Tissue::healthy(W, H, &p);
+        assert!(t.wound_mask.iter().all(|m| !m));
+        for i in [0, center(), t.len() - 1] {
+            assert!((t.integrity(i) - 1.0).abs() < 1e-5);
+            assert!((t.strength(i) - 1.0).abs() < 1e-5);
+            assert_eq!(t.bacteria_total(i), 0.0);
+        }
+    }
+
+    #[test]
+    fn circular_wound_has_expected_area_and_depth() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(W, H, &p);
+        let r = 16.0;
+        t.injure(WoundShape::Circle { radius: r }, 2.5, &p);
+        let cells = t.wound_mask.iter().filter(|m| **m).count() as f32;
+        let expected = std::f32::consts::PI * r * r;
+        assert!((cells - expected).abs() / expected < 0.05, "{cells} против {expected}");
+        let c = center();
+        assert!((t.depth.data[c] - 2.5).abs() < 1e-5);
+        assert_eq!(t.epithelium.data[c], 0.0);
+        assert_eq!(t.bleeding.data[c], 1.0);
+        assert_eq!(t.collagen.data[c], 0.0, "полнослойная рана уносит всю дерму");
+        assert_eq!(t.depth.data[0], 0.0, "угол участка не задет");
+    }
+
+    #[test]
+    fn partial_thickness_wound_keeps_part_of_dermis() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(W, H, &p);
+        t.injure(WoundShape::Circle { radius: 10.0 }, 1.1, &p);
+        let c = center();
+        assert!((t.collagen.data[c] - 0.5).abs() < 1e-4);
+        assert!((t.vessels.data[c] - 0.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn superficial_abrasion_barely_bleeds() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(W, H, &p);
+        t.injure(WoundShape::Circle { radius: 10.0 }, 0.1, &p);
+        assert!(t.bleeding.data[center()] < 0.25);
+    }
+
+    #[test]
+    fn deeper_injury_rescales_regenerated_fractions() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(W, H, &p);
+        t.injure(WoundShape::Circle { radius: 10.0 }, 9.0, &p);
+        let c = center();
+        t.myo.data[c] = 0.8;
+        t.fat_new.data[c] = 0.5;
+        t.injure_disk((W / 2) as f32, (H / 2) as f32, 3.0, 12.0, &p);
+        let lost_before = p.lost_muscle_mm(9.0);
+        let lost_after = p.lost_muscle_mm(12.0);
+        assert!((t.myo.data[c] - 0.8 * lost_before / lost_after).abs() < 1e-5);
+        assert!((t.fat_new.data[c] - 0.5).abs() < 1e-5, "вся клетчатка уже была утрачена");
+    }
+
+    #[test]
+    fn excision_turns_cell_into_wound() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(W, H, &p);
+        t.excise(5, 2.6, &p);
+        assert!(t.wound_mask[5]);
+        assert!((t.depth.data[5] - 2.6).abs() < 1e-5);
+        assert_eq!(t.epithelium.data[5], 0.0);
     }
 }

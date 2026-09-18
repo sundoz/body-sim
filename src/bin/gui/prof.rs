@@ -65,3 +65,30 @@ impl Prof {
         s
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn averages_and_maxima() {
+        let mut p = Prof::new();
+        p.add("a", 2.0);
+        p.add("a", 1.0);
+        p.add("b", 5.0);
+        p.end_frame();
+        p.add("a", 1.0);
+        p.end_frame();
+        assert_eq!(p.frames, 2);
+        let a = p.names.iter().position(|n| *n == "a").unwrap();
+        assert!((p.sums[a] / 2.0 - 2.0).abs() < 1e-9, "среднее (3 + 1) / 2");
+        assert!((p.maxs[a] - 3.0).abs() < 1e-9);
+        let r = p.report();
+        assert!(r.contains("a") && r.contains("b") && r.contains("кадров: 2"));
+        let v = p.time("c", || 42);
+        assert_eq!(v, 42);
+        p.reset();
+        assert_eq!(p.frames, 0);
+        assert!(p.names.is_empty());
+    }
+}

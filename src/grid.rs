@@ -30,3 +30,32 @@ impl Field {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn laplacian_of_constant_field_is_zero() {
+        let f = Field::new(8, 5, 3.0);
+        let mut out = vec![1.0; 40];
+        f.laplacian_into(&mut out);
+        assert!(out.iter().all(|v| v.abs() < 1e-6));
+    }
+
+    #[test]
+    fn laplacian_conserves_mass_with_neumann_boundary() {
+        let (w, h) = (7, 6);
+        let mut f = Field::new(w, h, 0.0);
+        f.data[0] = 1.0; // угол
+        f.data[3 * w + 3] = 2.0; // внутренняя клетка
+        let mut out = vec![0.0; w * h];
+        f.laplacian_into(&mut out);
+        let sum: f32 = out.iter().sum();
+        assert!(sum.abs() < 1e-5, "диффузия не должна создавать или терять вещество: {sum}");
+        assert!((out[3 * w + 3] + 8.0).abs() < 1e-6);
+        assert!((out[3 * w + 4] - 2.0).abs() < 1e-6);
+        // В углу два соседа «за краем» равны самой клетке.
+        assert!((out[0] + 2.0).abs() < 1e-6);
+    }
+}

@@ -14,7 +14,7 @@ mod ui;
 use body_sim::params::Scenario;
 use body_sim::report::{Metrics, View};
 use body_sim::simulation::Simulation;
-use body_sim::therapy::{Antiseptic, EventKind};
+use body_sim::therapy::{Antibiotic, Antiseptic, Debrider, EventKind};
 use body_sim::tissue::WoundShape;
 use macroquad::prelude::*;
 use render3d::{OrbitCam, Scene3D};
@@ -71,7 +71,8 @@ struct App {
     tab: Tab,
     agent: Antiseptic,
     dressing: Option<f32>,
-    abx: Option<f32>,
+    /// Интервал введения каждого антибиотика (по `Antibiotic::index`).
+    abx: [Option<f32>; 3],
 }
 
 impl App {
@@ -95,7 +96,7 @@ impl App {
             tab: Tab::Patient,
             agent: Antiseptic::Octenidine,
             dressing: None,
-            abx: None,
+            abx: [None; 3],
         };
         app.reset();
         app
@@ -115,7 +116,7 @@ impl App {
         self.sim = Self::make_sim(self.scenario, self.shape, self.size_mm, self.depth_mm);
         self.pending_steps = 0.0;
         self.dressing = None;
-        self.abx = None;
+        self.abx = [None; 3];
     }
 
     fn update(&mut self, frame_dt: f32) {
@@ -143,12 +144,12 @@ impl App {
         }
     }
 
-    fn set_antibiotic(&mut self, every: Option<f32>) {
-        self.abx = every;
+    fn set_antibiotic(&mut self, drug: Antibiotic, every: Option<f32>) {
+        self.abx[drug.index()] = every;
         let now = self.sim.hours();
         match every {
-            Some(h) => self.sim.therapy.start_antibiotic(h, now),
-            None => self.sim.therapy.stop_antibiotic(),
+            Some(h) => self.sim.therapy.start_antibiotic(drug, h, now),
+            None => self.sim.therapy.stop_antibiotic(drug),
         }
     }
 
@@ -427,7 +428,9 @@ fn draw_tooltip(ui: &Ui, app: &App, i: usize) {
         ("Нейтрофилы", format!("{:.2}", t.neutrophils.data[i])),
         ("Макрофаги M1 / M2", format!("{:.2} / {:.2}", t.m1.data[i], t.m2.data[i])),
         ("Фибробласты", format!("{:.2}", t.fibroblasts.data[i])),
-        ("Антисептик / антибиотик", format!("{:.2} / {:.1}", t.antiseptic.data[i], t.antibiotic.data[i])),
+        ("Антисептик / антибиотики", format!("{:.2} / {:.1} МПК", t.antiseptic.data[i], t.antibiotic.data[i])),
+        ("Мышца: волокна / фиброз", format!("{:.0}% / {:.0}%", t.myo.data[i] * 100.0, t.muscle_scar.data[i] * 100.0)),
+        ("Клетчатка: жир вернулся", format!("{:.0}%", t.fat_new.data[i] * 100.0)),
         ("Прочность", format!("{:.0}%", t.strength(i) * 100.0)),
     ];
     let w = 272.0;
@@ -534,74 +537,95 @@ fn draw_patient_tab(ui: &Ui, app: &mut App, x: f32, mut y: f32, iw: f32) {
 fn draw_treatment_tab(ui: &Ui, app: &mut App, x: f32, mut y: f32, iw: f32) {
     ui.section("АНТИСЕПТИК (МЕСТНО)", x, y);
     y += 20.0;
-    let half = (iw - 6.0) / 2.0;
+    let third = (iw - 12.0) / 3.0;
     for (k, a) in Antiseptic::ALL.iter().enumerate() {
-        let r = Rect::new(x + (k % 2) as f32 * (half + 6.0), y + (k / 2) as f32 * 36.0, half, 30.0);
-        if ui.button_sized(r, a.title(), app.agent == *a, 14) && app.agent != *a {
+        let r = Rect::new(x + (k % 3) as f32 * (third + 6.0), y + (k / 3) as f32 * 32.0, third, 27.0);
+        if ui.button_sized(r, a.title(), app.agent == *a, 13) && app.agent != *a {
             app.agent = *a;
             if app.dressing.is_some() {
                 app.set_dressing(app.dressing);
             }
         }
     }
-    y += 72.0;
+    y += 64.0;
     let pr = app.agent.props();
     let info = format!(
-        "бактерицидность {} · биоплёнка {} · токсичность {}",
+        "бактерицидность {} · в биоплёнку {} · в некроз {}",
         dots(pr.kill / 3.0),
         dots(pr.biofilm_pen),
-        dots(pr.cytotox / 0.12)
+        dots(pr.necro_pen)
     );
-    ui.text(&info, x, y + 12.0, 12, ui::MUTED);
-    y += 22.0;
-    if ui.button_sized(Rect::new(x, y, 150.0, 30.0), "Обработать", false, 14) {
+    ui.text(&info, x, y + 11.0, 12, ui::MUTED);
+    let tox = format!("токсичность: эпителий {} · фибробласты {}", dots(pr.tox_epi / 0.12), dots(pr.tox_fib / 0.12));
+    ui.text(&tox, x, y + 27.0, 12, ui::MUTED);
+    y += 34.0;
+    if ui.button_sized(Rect::new(x, y, 130.0, 28.0), "Обработать", false, 14) {
         app.apply_antiseptic();
     }
-    ui.text("перевязки:", x + 162.0, y + 20.0, 13, ui::MUTED);
-    if let Some(d) = button_row(ui, x + 236.0, y, iw - 236.0, &DRESSINGS, app.dressing) {
+    ui.text("перевязки:", x + 142.0, y + 19.0, 13, ui::MUTED);
+    if let Some(d) = button_row(ui, x + 216.0, y, iw - 216.0, &DRESSINGS, app.dressing) {
         app.set_dressing(d);
     }
-    y += 42.0;
+    y += 38.0;
 
-    ui.section("АНТИБИОТИК (СИСТЕМНО), ДОЗА КАЖДЫЕ", x, y);
+    ui.section("АНТИБИОТИКИ (СИСТЕМНО), ДОЗА КАЖДЫЕ", x, y);
     y += 20.0;
-    if let Some(a) = button_row(ui, x, y, iw, &ABX, app.abx) {
-        app.set_antibiotic(a);
+    for drug in Antibiotic::ALL {
+        ui.text(drug.title(), x, y + 18.0, 13, ui::TEXT);
+        if let Some(a) = button_row(ui, x + 104.0, y, iw - 104.0, &ABX, app.abx[drug.index()]) {
+            app.set_antibiotic(drug, a);
+        }
+        y += 31.0;
     }
-    y += 36.0;
     let plasma = app.sim.tissue.abx_plasma;
-    metric_row(ui, x, y, iw, "В плазме", &format!("{plasma:.1} МПК"), plasma / 10.0, chart::COLORS[13]);
-    y += 26.0;
-    ui.text("в некроз, биоплёнку и ишемизированную ткань почти не попадает", x, y + 10.0, 12, ui::MUTED);
-    y += 24.0;
-
-    ui.section("ХИРУРГИЯ", x, y);
-    y += 20.0;
-    if ui.button_sized(Rect::new(x, y, iw, 30.0), "Хирургическая обработка раны", false, 14) {
-        app.debride();
-    }
-    y += 36.0;
-    ui.text("иссечь некроз и инфицированную ткань — рана станет больше", x, y + 10.0, 12, ui::MUTED);
+    let levels = format!(
+        "в плазме, МПК: цефазолин {:.1} · клиндамицин {:.1} · ванкомицин {:.1}",
+        plasma[0], plasma[1], plasma[2]
+    );
+    ui.text(&levels, x, y + 11.0, 12, ui::MUTED);
     y += 22.0;
 
-    // Последняя процедура каждого вида (дозы антибиотика не перечисляем — их видно на графике).
-    for kind in [EventKind::Debridement, EventKind::Antiseptic] {
-        let what = if kind == EventKind::Debridement { "хирургическая обработка" } else { "антисептик" };
-        let last = app.sim.therapy.events.iter().rev().find(|e| e.kind == kind);
-        let text = match last {
-            Some(ev) => format!("{what}: день {:.1}", ev.hours / 24.0),
-            None => format!("{what}: не было"),
-        };
-        draw_rectangle(x, y + 4.0, 8.0, 8.0, chart::event_color(kind));
-        ui.text(&text, x + 16.0, y + 12.0, 13, ui::MUTED);
-        y += 18.0;
+    ui.section("ОЧИЩЕНИЕ ОТ НЕКРОЗА", x, y);
+    y += 20.0;
+    let quarter = (iw - 18.0) / 4.0;
+    if ui.button_sized(Rect::new(x, y, quarter, 28.0), "Хирургия", false, 13) {
+        app.debride();
     }
+    for (k, d) in Debrider::ALL.iter().enumerate() {
+        let r = Rect::new(x + (k + 1) as f32 * (quarter + 6.0), y, quarter, 28.0);
+        let on = app.sim.tissue.debriders[d.index()];
+        if ui.button_sized(r, d.title(), on, 13) {
+            app.sim.tissue.debriders[d.index()] = !on;
+            app.sim.touch();
+        }
+    }
+    y += 34.0;
+    ui.text("хирургия — сразу · личинки — 1–2 нед. · ферменты и гель — дольше", x, y + 11.0, 12, ui::MUTED);
+    y += 18.0;
+    let last = |kind: EventKind| app.sim.therapy.events.iter().rev().find(|e| e.kind == kind).map(|e| e.hours / 24.0);
+    let fmt = |d: Option<f32>| d.map_or("не было".to_string(), |d| format!("день {d:.1}"));
+    let text = format!(
+        "последняя хирургия: {} · антисептик: {}",
+        fmt(last(EventKind::Debridement)),
+        fmt(last(EventKind::Antiseptic))
+    );
+    ui.text(&text, x, y + 11.0, 12, ui::MUTED);
 }
 
 fn draw_metrics(ui: &Ui, m: &Metrics, x: f32, mut y: f32, iw: f32) {
     ui.section("ПОКАЗАТЕЛИ В ОБЛАСТИ РАНЫ", x, y);
     y += 22.0;
     let c = |i: usize| chart::COLORS[i];
+    let muscle = if m.lost_muscle_mm > 0.0 {
+        format!("−{:.1} мм: волокна {:.0}% · фиброз {:.0}%", m.lost_muscle_mm, m.muscle_regen * 100.0, m.muscle_fibrosis * 100.0)
+    } else {
+        "не задета".to_string()
+    };
+    let fat = if m.lost_fat_mm > 0.0 {
+        format!("−{:.1} мм: жир вернулся {:.0}%", m.lost_fat_mm, m.fat_regen * 100.0)
+    } else {
+        "не задета".to_string()
+    };
     let rows: [(&str, String, f32, Color); 12] = [
         ("Открытая площадь", format!("{:.1} из {:.1} мм²", m.open_mm2, m.wound_mm2), m.open_fraction, c(0)),
         ("Глубина полости", format!("{:.1} мм (макс. {:.1})", m.depth, m.depth_max), m.depth / 5.0, c(1)),
@@ -613,12 +637,17 @@ fn draw_metrics(ui: &Ui, m: &Metrics, x: f32, mut y: f32, iw: f32) {
             c(3),
         ),
         ("Биоплёнка", format!("{:.2}", m.biofilm), m.biofilm, c(5)),
-        ("Нейтрофилы", format!("{:.2}", m.neutrophils), m.neutrophils, c(6)),
-        ("Макрофаги M1 / M2", format!("{:.2} / {:.2}", m.m1, m.m2), m.m1 + m.m2, c(8)),
+        (
+            "Нейтрофилы · M1 · M2",
+            format!("{:.2} · {:.2} · {:.2}", m.neutrophils, m.m1, m.m2),
+            m.neutrophils,
+            c(6),
+        ),
         ("Фибробласты", format!("{:.2}", m.fibroblasts), m.fibroblasts, c(9)),
-        ("Сосуды", format!("{:.2}", m.vessels), m.vessels, c(10)),
-        ("Кислород", format!("{:.2}", m.oxygen), m.oxygen, Color::new(0.55, 0.85, 0.95, 1.0)),
+        ("Сосуды · кислород", format!("{:.2} · {:.2}", m.vessels, m.oxygen), m.vessels, c(10)),
         ("Коллаген", format!("{:.2}", m.collagen), m.collagen, c(11)),
+        ("Мышца", muscle, m.muscle_regen, Color::new(0.80, 0.30, 0.34, 1.0)),
+        ("Клетчатка", fat, m.fat_regen, Color::new(0.96, 0.80, 0.40, 1.0)),
         ("Прочность рубца", format!("{:.0}%", m.strength * 100.0), m.strength, c(12)),
     ];
     for (name, val, frac, color) in rows.iter() {
@@ -674,7 +703,8 @@ struct Opts {
     treat_tab: bool,
     days: Option<f32>,
     antiseptic: Option<Antiseptic>,
-    antibiotic_every: Option<f32>,
+    antibiotics: Vec<(Antibiotic, f32)>,
+    debriders: Vec<Debrider>,
     debride: Vec<f32>,
     screenshot: Option<String>,
     bench: Option<u32>,
@@ -694,7 +724,8 @@ fn parse_opts() -> Opts {
         treat_tab: false,
         days: None,
         antiseptic: None,
-        antibiotic_every: None,
+        antibiotics: Vec::new(),
+        debriders: Vec::new(),
         debride: Vec::new(),
         screenshot: None,
         bench: None,
@@ -719,7 +750,17 @@ fn parse_opts() -> Opts {
                     }
                     "--days" => o.days = v.parse().ok(),
                     "--antiseptic" => o.antiseptic = Antiseptic::parse(&v),
-                    "--antibiotic-every" => o.antibiotic_every = v.parse().ok(),
+                    "--antibiotic-every" => o.antibiotics.extend(v.parse().ok().map(|h| (Antibiotic::Cefazolin, h))),
+                    "--antibiotics" => {
+                        for item in v.split(',') {
+                            if let Some((name, every)) = item.split_once(':') {
+                                if let (Some(d), Ok(h)) = (Antibiotic::parse(name.trim()), every.trim().parse()) {
+                                    o.antibiotics.push((d, h));
+                                }
+                            }
+                        }
+                    }
+                    "--debriders" => o.debriders = v.split(',').filter_map(|s| Debrider::parse(s.trim())).collect(),
                     "--debride" => o.debride = v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
                     "--screenshot" => o.screenshot = Some(v),
                     "--bench" => o.bench = v.parse().ok(),
@@ -766,8 +807,11 @@ async fn main() {
         app.agent = a;
         app.set_dressing(Some(24.0));
     }
-    if let Some(h) = opts.antibiotic_every {
-        app.set_antibiotic(Some(h));
+    for (drug, h) in &opts.antibiotics {
+        app.set_antibiotic(*drug, Some(*h));
+    }
+    for d in &opts.debriders {
+        app.sim.tissue.debriders[d.index()] = true;
     }
     if let Some(days) = opts.days {
         let per_hour = app.sim.steps_per_hour();
