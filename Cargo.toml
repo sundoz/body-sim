@@ -1,0 +1,29 @@
+[package]
+name = "body-sim"
+version = "0.1.0"
+edition = "2021"
+description = "Симулятор регенерации тканей человека (MVP: заживление кожной раны)"
+default-run = "body-sim-gui"
+
+[lib]
+name = "body_sim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "body-sim"
+path = "src/main.rs"
+
+[[bin]]
+name = "body-sim-gui"
+path = "src/bin/gui/main.rs"
+
+[dependencies]
+macroquad = { version = "0.4.16", default-features = false }
+
+[profile.release]
+debug = false
+lto = "thin"
+
+# Модель считается и в debug-сборке, но без оптимизаций заметно медленнее.
+[profile.dev.package."*"]
+opt-level = 2

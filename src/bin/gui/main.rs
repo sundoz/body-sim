@@ -1,0 +1,830 @@
+//! Графический интерфейс симулятора: живая ткань (сверху или в разрезе),
+//! пациент, рана, лечение, графики.
+//!
+//! ЛКМ по ткани — нанести рану выбранной глубины, ПКМ — провести линию разреза,
+//! колесо — размер кисти, Пробел — пауза, R — начать заново, → — шаг на 1 час при паузе,
+//! Tab — сверху / разрез.
+
+mod chart;
+mod paint;
+mod render3d;
+mod ui;
+
+use body_sim::params::Scenario;
+use body_sim::report::{Metrics, View};
+use body_sim::simulation::Simulation;
+use body_sim::therapy::{Antiseptic, EventKind};
+use body_sim::tissue::WoundShape;
+use macroquad::prelude::*;
+use render3d::{OrbitCam, Scene3D};
+use ui::Ui;
+
+const GRID_W: usize = 96;
+const GRID_H: usize = 48;
+const CELL_PX: f32 = 10.0;
+const MAX_STEPS_PER_FRAME: usize = 600;
+const SPEEDS: [(f32, &str); 6] = [(0.25, "¼"), (0.5, "½"), (1.0, "1"), (2.0, "2"), (5.0, "5"), (10.0, "10")];
+const DEPTHS: [(f32, &str, &str); 5] = [
+    (0.1, "0.1", "эпидермис: заживает из фолликулов, без рубца"),
+    (1.0, "1", "дерма: островки эпителия из придатков, мягкий рубец"),
+    (2.5, "2.5", "полнослойная: полость заполняют грануляции, рубец"),
+    (5.0, "5", "до клетчатки: дно раны плохо кровоснабжается"),
+    (9.0, "9", "до мышцы: долгое заполнение глубокой полости"),
+];
+const DRESSINGS: [(Option<f32>, &str); 3] = [(None, "нет"), (Some(12.0), "12 ч"), (Some(24.0), "24 ч")];
+const ABX: [(Option<f32>, &str); 4] = [(None, "нет"), (Some(8.0), "8 ч"), (Some(12.0), "12 ч"), (Some(24.0), "24 ч")];
+
+fn view_rect() -> Rect {
+    Rect::new(20.0, 72.0, GRID_W as f32 * CELL_PX, GRID_H as f32 * CELL_PX)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    Circle,
+    Cut,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Patient,
+    Treatment,
+}
+
+struct App {
+    scenario: Scenario,
+    shape: Shape,
+    size_mm: f32,
+    depth_mm: f32,
+    sim: Simulation,
+    playing: bool,
+    speed: f32,
+    pending_steps: f32,
+    view: Option<View>,
+    /// Срезать ли блок через рану и по какой строке сетки.
+    cut: bool,
+    cut_row: usize,
+    orbiting: bool,
+    last_mouse: Vec2,
+    brush_mm: f32,
+    visible: [bool; chart::N],
+    tab: Tab,
+    agent: Antiseptic,
+    dressing: Option<f32>,
+    abx: Option<f32>,
+}
+
+impl App {
+    fn new(scenario: Scenario) -> Self {
+        let mut app = Self {
+            scenario,
+            shape: Shape::Circle,
+            size_mm: 4.0,
+            depth_mm: 2.5,
+            sim: Self::make_sim(scenario, Shape::Circle, 4.0, 2.5),
+            playing: true,
+            speed: 1.0,
+            pending_steps: 0.0,
+            view: None,
+            cut: true,
+            cut_row: GRID_H / 2,
+            orbiting: false,
+            last_mouse: Vec2::ZERO,
+            brush_mm: 1.0,
+            visible: chart::DEFAULT_VISIBLE,
+            tab: Tab::Patient,
+            agent: Antiseptic::Octenidine,
+            dressing: None,
+            abx: None,
+        };
+        app.reset();
+        app
+    }
+
+    fn make_sim(scenario: Scenario, shape: Shape, size_mm: f32, depth_mm: f32) -> Simulation {
+        let p = scenario.params();
+        let r = size_mm / p.cell_mm;
+        let shape = match shape {
+            Shape::Circle => WoundShape::Circle { radius: r },
+            Shape::Cut => WoundShape::Cut { half_length: 2.0 * r, half_width: 1.0 / p.cell_mm },
+        };
+        Simulation::new(p, GRID_W, GRID_H, shape, depth_mm)
+    }
+
+    fn reset(&mut self) {
+        self.sim = Self::make_sim(self.scenario, self.shape, self.size_mm, self.depth_mm);
+        self.pending_steps = 0.0;
+        self.dressing = None;
+        self.abx = None;
+    }
+
+    fn update(&mut self, frame_dt: f32) {
+        if !self.playing {
+            return;
+        }
+        self.pending_steps += frame_dt.min(0.1) * self.speed * 24.0 / self.sim.p.dt;
+        let n = self.pending_steps.floor() as usize;
+        let n = if n > MAX_STEPS_PER_FRAME {
+            self.pending_steps = 0.0;
+            MAX_STEPS_PER_FRAME
+        } else {
+            self.pending_steps -= n as f32;
+            n
+        };
+        self.sim.run_steps(n);
+    }
+
+    fn set_dressing(&mut self, every: Option<f32>) {
+        self.dressing = every;
+        let now = self.sim.hours();
+        match every {
+            Some(h) => self.sim.therapy.start_antiseptic(self.agent, h, now),
+            None => self.sim.therapy.stop_antiseptic(),
+        }
+    }
+
+    fn set_antibiotic(&mut self, every: Option<f32>) {
+        self.abx = every;
+        let now = self.sim.hours();
+        match every {
+            Some(h) => self.sim.therapy.start_antibiotic(h, now),
+            None => self.sim.therapy.stop_antibiotic(),
+        }
+    }
+
+    fn apply_antiseptic(&mut self) {
+        let now = self.sim.hours();
+        let s = &mut self.sim;
+        s.therapy.apply_antiseptic_now(&mut s.tissue, self.agent, now);
+    }
+
+    fn debride(&mut self) {
+        let now = self.sim.hours();
+        let s = &mut self.sim;
+        s.therapy.debride_now(&mut s.tissue, &s.p, now);
+    }
+}
+
+// ---------------------------------------------------------------- шапка
+
+fn badge(ui: &Ui, right: f32, y: f32, label: &str, color: Color) -> f32 {
+    let bw = ui.measure(label, 14, true) + 24.0;
+    let r = Rect::new(right - bw, y, bw, 26.0);
+    ui::fill_rounded(r, 13.0, color);
+    ui.bold(label, r.x + 12.0, r.y + 18.0, 14, Color::new(0.06, 0.06, 0.08, 1.0));
+    r.x
+}
+
+fn draw_header(ui: &Ui, app: &App) {
+    ui.bold("Регенерация кожи", 20.0, 34.0, 24, ui::TEXT);
+    let wound = match app.shape {
+        Shape::Circle => format!("круглая рана Ø{:.0} мм", 2.0 * app.size_mm),
+        Shape::Cut => format!("разрез {:.0} мм", 4.0 * app.size_mm),
+    };
+    let sub = format!(
+        "{} · {}, глубина {} мм ({})",
+        app.scenario.title(),
+        wound,
+        app.depth_mm,
+        app.sim.p.layer_title(app.depth_mm)
+    );
+    ui.text(&sub, 20.0, 56.0, 14, ui::MUTED);
+
+    let m = app.sim.latest();
+    let right = view_rect().x + view_rect().w;
+    let cond = m.condition();
+    let x = badge(ui, right, 16.0, cond.title(), chart::condition_color(cond));
+    let x = badge(ui, x - 8.0, 16.0, m.phase().title(), chart::phase_color(m.phase()));
+
+    let day = format!("День {:.1}", app.sim.hours() / 24.0);
+    let dw = ui.measure(&day, 24, true);
+    ui.bold(&day, x - 16.0 - dw, 38.0, 24, ui::TEXT);
+    if let Some(h) = app.sim.closed_at {
+        ui.text_right(&format!("эпителизация за {:.1} дн.", h / 24.0), right, 60.0, 13, ui::MUTED);
+    }
+}
+
+// ---------------------------------------------------------------- ткань (3D)
+
+fn shadow_text(ui: &Ui, s: &str, x: f32, y: f32, size: u16, color: Color) {
+    ui.text(s, x + 1.0, y + 1.0, size, Color::new(0.0, 0.0, 0.0, 0.7));
+    ui.text(s, x, y, size, color);
+}
+
+/// Строка сетки, через которую проходит передний срез блока (None — блок целиком).
+fn cut_row(app: &App) -> Option<usize> {
+    app.cut.then_some(app.cut_row)
+}
+
+/// До какой строки (в непрерывных координатах сетки) простирается видимая поверхность.
+fn gy_limit(app: &App) -> f32 {
+    if app.cut {
+        app.cut_row as f32
+    } else {
+        GRID_H as f32 - 0.5
+    }
+}
+
+/// Управление камерой: ПКМ — вращать, колесо — приблизить, Shift+колесо — кисть, ↑/↓ — срез.
+fn camera_input(ui: &Ui, app: &mut App, scene: &mut Scene3D) {
+    let r = view_rect();
+    let m = ui.mouse();
+    if ui.right_clicked() && (r.contains(m) || app.orbiting) {
+        if app.orbiting {
+            let d = m - app.last_mouse;
+            scene.cam.yaw -= d.x * 0.008;
+            scene.cam.pitch = (scene.cam.pitch + d.y * 0.006).clamp(0.08, 1.52);
+        }
+        app.orbiting = true;
+    } else {
+        app.orbiting = false;
+    }
+    app.last_mouse = m;
+
+    let wheel = if ui.inert { 0.0 } else { mouse_wheel().1 };
+    if wheel != 0.0 && r.contains(m) {
+        if is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift) {
+            app.brush_mm = (app.brush_mm + wheel.signum() * 0.25).clamp(0.5, 4.0);
+        } else {
+            scene.cam.dist = (scene.cam.dist * if wheel > 0.0 { 0.9 } else { 1.11 }).clamp(14.0, 90.0);
+        }
+    }
+    if is_key_pressed(KeyCode::Up) && app.cut_row > 0 {
+        app.cut_row -= 1;
+    }
+    if is_key_pressed(KeyCode::Down) && app.cut_row + 1 < GRID_H {
+        app.cut_row += 1;
+    }
+}
+
+/// 3D-вид ткани. Возвращает клетку под курсором.
+fn draw_tissue_3d(ui: &Ui, app: &mut App, scene: &mut Scene3D) -> Option<usize> {
+    let r = view_rect();
+    // Фон — мягкий вертикальный градиент, как в студии.
+    let bands = 32;
+    for k in 0..bands {
+        let t = k as f32 / (bands - 1) as f32;
+        let y = r.y + r.h * k as f32 / bands as f32;
+        let c = Color::new(0.13 - 0.07 * t, 0.135 - 0.07 * t, 0.16 - 0.075 * t, 1.0);
+        draw_rectangle(r.x, y, r.w, r.h / bands as f32 + 1.0, c);
+    }
+
+    scene.update(&app.sim.tissue, &app.sim.p, app.view, cut_row(app));
+    let pick = if app.orbiting { None } else { scene.pick(r, ui.mouse(), gy_limit(app)) };
+    if let Some(p) = &pick {
+        if ui.mouse_down() {
+            let rad = app.brush_mm / app.sim.p.cell_mm;
+            app.sim.injure_disk(p.gx, p.gy, rad, app.depth_mm);
+        }
+    }
+    scene.draw(r, pick.as_ref(), app.brush_mm);
+
+    // Подписи слоёв у ребра среза — как выноски в атласе.
+    if app.view.is_none() {
+        let p = &app.sim.p;
+        let layers = [
+            ("эпидермис и дерма", p.epidermis_mm + p.dermis_mm / 2.0),
+            ("жировая клетчатка", p.skin_bottom_mm() + p.fat_mm / 2.0),
+            ("фасция", p.fat_bottom_mm() + 0.15),
+            ("мышца", p.fat_bottom_mm() + 2.0),
+        ];
+        let gy = gy_limit(app);
+        for (name, depth) in layers {
+            let left = scene.project(r, scene.front_edge_point(false, gy, depth));
+            let right = scene.project(r, scene.front_edge_point(true, gy, depth));
+            let (Some(a), Some(b)) = (left, right) else { continue };
+            let w = ui.measure(name, 13, false);
+            let (anchor, tx) = if a.x - 40.0 - w > r.x + 6.0 {
+                (a, a.x - 40.0 - w)
+            } else {
+                (b, b.x + 40.0)
+            };
+            if tx < r.x || tx + w > r.x + r.w || anchor.y < r.y || anchor.y > r.y + r.h {
+                continue;
+            }
+            let lx = if tx < anchor.x { tx + w + 4.0 } else { tx - 4.0 };
+            draw_line(anchor.x, anchor.y, lx, anchor.y, 1.0, Color::new(1.0, 1.0, 1.0, 0.6));
+            draw_circle(anchor.x, anchor.y, 2.5, WHITE);
+            shadow_text(ui, name, tx, anchor.y + 4.0, 13, WHITE);
+        }
+    }
+
+    let cut_note = if app.cut {
+        format!("срез через y = {:.1} мм (↑/↓)", (app.cut_row as f32 + 0.5) * app.sim.p.cell_mm)
+    } else {
+        "блок целиком".to_string()
+    };
+    draw_rectangle(r.x, r.y, r.w, 30.0, Color::new(0.0, 0.0, 0.0, 0.35));
+    shadow_text(
+        ui,
+        &format!("ЛКМ — рана · ПКМ — вращать · колесо — масштаб · Shift+колесо — кисть {:.1} мм · {cut_note}", app.brush_mm),
+        r.x + 12.0,
+        r.y + 20.0,
+        12,
+        Color::new(1.0, 1.0, 1.0, 0.85),
+    );
+
+    pick.map(|p| {
+        let ix = (p.gx.round().max(0.0) as usize).min(GRID_W - 1);
+        let iy = (p.gy.round().max(0.0) as usize).min(GRID_H - 1);
+        iy * GRID_W + ix
+    })
+}
+
+fn draw_legend_overlay(ui: &Ui, view: Option<View>) {
+    let r = view_rect();
+    match view {
+        None => {
+            let cols = 3;
+            let cw = 124.0;
+            let rows = paint::LEGEND.len().div_ceil(cols);
+            let bw = cols as f32 * cw + 12.0;
+            let bh = rows as f32 * 18.0 + 12.0;
+            let (bx, by) = (r.x + r.w - bw - 8.0, r.y + r.h - bh - 8.0);
+            draw_rectangle(bx, by, bw, bh, Color::new(0.0, 0.0, 0.0, 0.5));
+            for (k, (name, c)) in paint::LEGEND.iter().enumerate() {
+                let x = bx + 8.0 + (k % cols) as f32 * cw;
+                let y = by + 18.0 + (k / cols) as f32 * 18.0;
+                draw_rectangle(x, y - 10.0, 11.0, 11.0, Color::new(c[0], c[1], c[2], 1.0));
+                ui.text(name, x + 16.0, y, 12, WHITE);
+            }
+        }
+        Some(v) => {
+            let w = 200.0;
+            let (bx, by) = (r.x + r.w - w - 150.0, r.y + r.h - 40.0);
+            draw_rectangle(bx - 30.0, by - 18.0, w + 170.0, 34.0, Color::new(0.0, 0.0, 0.0, 0.55));
+            ui.text("0", bx - 20.0, by + 4.0, 12, WHITE);
+            for k in 0..w as usize {
+                let c = paint::colormap(k as f32 / w);
+                draw_rectangle(bx + k as f32, by - 7.0, 1.0, 12.0, Color::new(c[0], c[1], c[2], 1.0));
+            }
+            ui.text(v.scale_label(), bx + w + 6.0, by + 4.0, 12, WHITE);
+            ui.bold(v.title(), bx + w + 50.0, by + 4.0, 12, WHITE);
+        }
+    }
+}
+
+fn draw_view_chips(ui: &Ui, app: &mut App, scene: &mut Scene3D) {
+    let r = view_rect();
+    let mut x = r.x;
+    let mut y = r.y + r.h + 8.0;
+    let h = 24.0;
+    let chip = |x: f32, y: f32, label: &str, active: bool| -> (bool, f32) {
+        let w = ui.measure(label, 13, active) + 20.0;
+        (ui.button_sized(Rect::new(x, y, w, h), label, active, 13), w)
+    };
+    let top = scene.cam.pitch > 1.4;
+    let (hit, w) = chip(x, y, "3D", !top);
+    if hit {
+        scene.cam = OrbitCam::atlas();
+    }
+    x += w + 4.0;
+    let (hit, w) = chip(x, y, "Сверху", top);
+    if hit {
+        scene.cam = OrbitCam::top();
+    }
+    x += w + 4.0;
+    let (hit, w) = chip(x, y, "Срез", app.cut);
+    if hit {
+        app.cut = !app.cut;
+    }
+    x += w + 16.0;
+    let views: Vec<Option<View>> = std::iter::once(None).chain(View::ALL.iter().copied().map(Some)).collect();
+    for v in views {
+        let label = v.map_or("Ткань", |v| v.title());
+        let w = ui.measure(label, 13, false) + 20.0;
+        if x + w > r.x + r.w {
+            x = r.x;
+            y += h + 4.0;
+        }
+        let (hit, w) = chip(x, y, label, app.view == v);
+        if hit {
+            app.view = v;
+        }
+        x += w + 4.0;
+    }
+}
+
+fn draw_tooltip(ui: &Ui, app: &App, i: usize) {
+    let t = &app.sim.tissue;
+    let p = &app.sim.p;
+    let x_mm = (i % GRID_W) as f32 * p.cell_mm;
+    let y_mm = (i / GRID_W) as f32 * p.cell_mm;
+    let rows = [
+        ("Глубина полости / макс.", format!("{:.1} / {:.1} мм", t.depth.data[i], t.depth_max.data[i])),
+        ("Слой дна", p.layer_title(t.depth_max.data[i]).to_string()),
+        ("Мёртвая ткань", format!("{:.2} мм", t.slough.data[i])),
+        ("Эпителий", format!("{:.2}", t.epithelium.data[i])),
+        ("Коллаген / зрелость", format!("{:.2} / {:.2}", t.collagen.data[i], t.maturity.data[i])),
+        ("Сосуды / кислород", format!("{:.2} / {:.2}", t.vessels.data[i], t.oxygen.data[i])),
+        ("Бактерии (устойч.)", format!("{:.3} ({:.3})", t.bacteria_total(i), t.bacteria_res.data[i])),
+        ("Биоплёнка", format!("{:.2}", t.biofilm.data[i])),
+        ("Нейтрофилы", format!("{:.2}", t.neutrophils.data[i])),
+        ("Макрофаги M1 / M2", format!("{:.2} / {:.2}", t.m1.data[i], t.m2.data[i])),
+        ("Фибробласты", format!("{:.2}", t.fibroblasts.data[i])),
+        ("Антисептик / антибиотик", format!("{:.2} / {:.1}", t.antiseptic.data[i], t.antibiotic.data[i])),
+        ("Прочность", format!("{:.0}%", t.strength(i) * 100.0)),
+    ];
+    let w = 272.0;
+    let h = 36.0 + rows.len() as f32 * 18.0;
+    let m = ui.mouse();
+    let mut x = m.x + 18.0;
+    let mut y = m.y + 18.0;
+    if x + w > screen_width() - 8.0 {
+        x = m.x - 18.0 - w;
+    }
+    if y + h > screen_height() - 8.0 {
+        y = m.y - 18.0 - h;
+    }
+    ui::fill_rounded(Rect::new(x - 1.0, y - 1.0, w + 2.0, h + 2.0), 8.0, ui::BORDER);
+    ui::fill_rounded(Rect::new(x, y, w, h), 7.0, Color::new(0.05, 0.055, 0.07, 0.97));
+    ui.bold(&format!("x {x_mm:.1} мм, y {y_mm:.1} мм"), x + 12.0, y + 22.0, 13, ui::TEXT);
+    for (k, (name, val)) in rows.iter().enumerate() {
+        let ry = y + 42.0 + k as f32 * 18.0;
+        ui.text(name, x + 12.0, ry, 13, ui::MUTED);
+        ui.text_right(val, x + w - 12.0, ry, 13, ui::TEXT);
+    }
+}
+
+// ---------------------------------------------------------------- панель
+
+fn metric_row(ui: &Ui, x: f32, y: f32, w: f32, name: &str, value: &str, frac: f32, color: Color) {
+    ui.text(name, x, y + 12.0, 13, ui::TEXT);
+    ui.text_right(value, x + w, y + 12.0, 13, ui::MUTED);
+    ui::fill_rounded(Rect::new(x, y + 17.0, w, 3.0), 1.5, ui::BTN);
+    if frac > 0.002 {
+        ui::fill_rounded(Rect::new(x, y + 17.0, w * frac.clamp(0.0, 1.0), 3.0), 1.5, color);
+    }
+}
+
+fn button_row<T: Copy + PartialEq>(ui: &Ui, x: f32, y: f32, w: f32, items: &[(T, &str)], current: T) -> Option<T> {
+    let gap = 6.0;
+    let bw = (w - gap * (items.len() - 1) as f32) / items.len() as f32;
+    let mut hit = None;
+    for (k, (v, label)) in items.iter().enumerate() {
+        if ui.button_sized(Rect::new(x + k as f32 * (bw + gap), y, bw, 30.0), label, *v == current, 14) {
+            hit = Some(*v);
+        }
+    }
+    hit
+}
+
+fn dots(n: f32) -> String {
+    let k = (n.clamp(0.0, 1.0) * 4.0).round() as usize;
+    "●".repeat(k) + &"○".repeat(4 - k)
+}
+
+fn draw_patient_tab(ui: &Ui, app: &mut App, x: f32, mut y: f32, iw: f32) {
+    ui.section("СЦЕНАРИЙ", x, y);
+    y += 20.0;
+    let half = (iw - 6.0) / 2.0;
+    for (k, s) in Scenario::ALL.iter().enumerate() {
+        let r = Rect::new(x + (k % 2) as f32 * (half + 6.0), y + (k / 2) as f32 * 36.0, half, 30.0);
+        if ui.button_sized(r, s.short(), app.scenario == *s, 14) && app.scenario != *s {
+            app.scenario = *s;
+            app.reset();
+        }
+    }
+    y += Scenario::ALL.len().div_ceil(2) as f32 * 36.0 + 6.0;
+
+    ui.section("РАНА", x, y);
+    y += 20.0;
+    if let Some(s) = button_row(ui, x, y, iw, &[(Shape::Circle, "Круглая"), (Shape::Cut, "Разрез")], app.shape) {
+        app.shape = s;
+        app.reset();
+    }
+    y += 36.0;
+    if ui.button(Rect::new(x, y, 30.0, 30.0), "−", false) && app.size_mm > 1.0 {
+        app.size_mm -= 1.0;
+        app.reset();
+    }
+    let size_label = format!("{:.0} мм", app.size_mm);
+    let sw = ui.measure(&size_label, 14, false);
+    ui.text(&size_label, x + 30.0 + (60.0 - sw) / 2.0, y + 20.0, 14, ui::TEXT);
+    if ui.button(Rect::new(x + 90.0, y, 30.0, 30.0), "+", false) && app.size_mm < 5.0 {
+        app.size_mm += 1.0;
+        app.reset();
+    }
+    if ui.button_sized(Rect::new(x + 132.0, y, iw - 132.0, 30.0), "Заново  (R)", false, 14) {
+        app.reset();
+    }
+    y += 42.0;
+
+    ui.section("ГЛУБИНА, ММ", x, y);
+    y += 20.0;
+    let items: Vec<(f32, &str)> = DEPTHS.iter().map(|(d, l, _)| (*d, *l)).collect();
+    if let Some(d) = button_row(ui, x, y, iw, &items, app.depth_mm) {
+        app.depth_mm = d;
+        app.reset();
+    }
+    y += 36.0;
+    if let Some((_, _, note)) = DEPTHS.iter().find(|(d, _, _)| *d == app.depth_mm) {
+        ui.text(note, x, y + 12.0, 13, ui::MUTED);
+    }
+    y += 30.0;
+    ui.text("ЛКМ по ткани — рана выбранной глубины", x, y + 12.0, 12, ui::MUTED);
+    ui.text(&format!("колесо — кисть {:.1} мм · ПКМ — линия разреза", app.brush_mm), x, y + 28.0, 12, ui::MUTED);
+}
+
+fn draw_treatment_tab(ui: &Ui, app: &mut App, x: f32, mut y: f32, iw: f32) {
+    ui.section("АНТИСЕПТИК (МЕСТНО)", x, y);
+    y += 20.0;
+    let half = (iw - 6.0) / 2.0;
+    for (k, a) in Antiseptic::ALL.iter().enumerate() {
+        let r = Rect::new(x + (k % 2) as f32 * (half + 6.0), y + (k / 2) as f32 * 36.0, half, 30.0);
+        if ui.button_sized(r, a.title(), app.agent == *a, 14) && app.agent != *a {
+            app.agent = *a;
+            if app.dressing.is_some() {
+                app.set_dressing(app.dressing);
+            }
+        }
+    }
+    y += 72.0;
+    let pr = app.agent.props();
+    let info = format!(
+        "бактерицидность {} · биоплёнка {} · токсичность {}",
+        dots(pr.kill / 3.0),
+        dots(pr.biofilm_pen),
+        dots(pr.cytotox / 0.12)
+    );
+    ui.text(&info, x, y + 12.0, 12, ui::MUTED);
+    y += 22.0;
+    if ui.button_sized(Rect::new(x, y, 150.0, 30.0), "Обработать", false, 14) {
+        app.apply_antiseptic();
+    }
+    ui.text("перевязки:", x + 162.0, y + 20.0, 13, ui::MUTED);
+    if let Some(d) = button_row(ui, x + 236.0, y, iw - 236.0, &DRESSINGS, app.dressing) {
+        app.set_dressing(d);
+    }
+    y += 42.0;
+
+    ui.section("АНТИБИОТИК (СИСТЕМНО), ДОЗА КАЖДЫЕ", x, y);
+    y += 20.0;
+    if let Some(a) = button_row(ui, x, y, iw, &ABX, app.abx) {
+        app.set_antibiotic(a);
+    }
+    y += 36.0;
+    let plasma = app.sim.tissue.abx_plasma;
+    metric_row(ui, x, y, iw, "В плазме", &format!("{plasma:.1} МПК"), plasma / 10.0, chart::COLORS[13]);
+    y += 26.0;
+    ui.text("в некроз, биоплёнку и ишемизированную ткань почти не попадает", x, y + 10.0, 12, ui::MUTED);
+    y += 24.0;
+
+    ui.section("ХИРУРГИЯ", x, y);
+    y += 20.0;
+    if ui.button_sized(Rect::new(x, y, iw, 30.0), "Хирургическая обработка раны", false, 14) {
+        app.debride();
+    }
+    y += 36.0;
+    ui.text("иссечь некроз и инфицированную ткань — рана станет больше", x, y + 10.0, 12, ui::MUTED);
+    y += 22.0;
+
+    // Последняя процедура каждого вида (дозы антибиотика не перечисляем — их видно на графике).
+    for kind in [EventKind::Debridement, EventKind::Antiseptic] {
+        let what = if kind == EventKind::Debridement { "хирургическая обработка" } else { "антисептик" };
+        let last = app.sim.therapy.events.iter().rev().find(|e| e.kind == kind);
+        let text = match last {
+            Some(ev) => format!("{what}: день {:.1}", ev.hours / 24.0),
+            None => format!("{what}: не было"),
+        };
+        draw_rectangle(x, y + 4.0, 8.0, 8.0, chart::event_color(kind));
+        ui.text(&text, x + 16.0, y + 12.0, 13, ui::MUTED);
+        y += 18.0;
+    }
+}
+
+fn draw_metrics(ui: &Ui, m: &Metrics, x: f32, mut y: f32, iw: f32) {
+    ui.section("ПОКАЗАТЕЛИ В ОБЛАСТИ РАНЫ", x, y);
+    y += 22.0;
+    let c = |i: usize| chart::COLORS[i];
+    let rows: [(&str, String, f32, Color); 12] = [
+        ("Открытая площадь", format!("{:.1} из {:.1} мм²", m.open_mm2, m.wound_mm2), m.open_fraction, c(0)),
+        ("Глубина полости", format!("{:.1} мм (макс. {:.1})", m.depth, m.depth_max), m.depth / 5.0, c(1)),
+        ("Некроз", format!("{:.1} мм²", m.necrotic_mm2), m.necrotic_mm2 / m.wound_mm2.max(1.0), c(2)),
+        (
+            "Бактерии",
+            format!("{:.2} · устойч. {:.0}%", m.bacteria, m.resistant_fraction * 100.0),
+            m.bacteria,
+            c(3),
+        ),
+        ("Биоплёнка", format!("{:.2}", m.biofilm), m.biofilm, c(5)),
+        ("Нейтрофилы", format!("{:.2}", m.neutrophils), m.neutrophils, c(6)),
+        ("Макрофаги M1 / M2", format!("{:.2} / {:.2}", m.m1, m.m2), m.m1 + m.m2, c(8)),
+        ("Фибробласты", format!("{:.2}", m.fibroblasts), m.fibroblasts, c(9)),
+        ("Сосуды", format!("{:.2}", m.vessels), m.vessels, c(10)),
+        ("Кислород", format!("{:.2}", m.oxygen), m.oxygen, Color::new(0.55, 0.85, 0.95, 1.0)),
+        ("Коллаген", format!("{:.2}", m.collagen), m.collagen, c(11)),
+        ("Прочность рубца", format!("{:.0}%", m.strength * 100.0), m.strength, c(12)),
+    ];
+    for (name, val, frac, color) in rows.iter() {
+        metric_row(ui, x, y, iw, name, val, *frac, *color);
+        y += 24.0;
+    }
+}
+
+fn draw_panel(ui: &Ui, app: &mut App) {
+    let pr = Rect::new(1000.0, 72.0, 420.0, 808.0);
+    ui::panel(pr);
+    let x = pr.x + 16.0;
+    let iw = pr.w - 32.0;
+
+    let tw = iw / 2.0;
+    if ui.tab(Rect::new(x, pr.y + 6.0, tw, 34.0), "Пациент и рана", app.tab == Tab::Patient) {
+        app.tab = Tab::Patient;
+    }
+    if ui.tab(Rect::new(x + tw, pr.y + 6.0, tw, 34.0), "Лечение", app.tab == Tab::Treatment) {
+        app.tab = Tab::Treatment;
+    }
+
+    // Время — общее для обеих вкладок.
+    let mut y = pr.y + 52.0;
+    let play_label = if app.playing { "Пауза" } else { "Пуск" };
+    if ui.button_sized(Rect::new(x, y, 84.0, 30.0), play_label, !app.playing, 14) {
+        app.playing = !app.playing;
+    }
+    if let Some(v) = button_row(ui, x + 92.0, y, iw - 92.0 - 64.0, &SPEEDS, app.speed) {
+        app.speed = v;
+    }
+    ui.text("дн/сек", x + iw - 54.0, y + 20.0, 12, ui::MUTED);
+    y += 44.0;
+
+    match app.tab {
+        Tab::Patient => draw_patient_tab(ui, app, x, y, iw),
+        Tab::Treatment => draw_treatment_tab(ui, app, x, y, iw),
+    }
+
+    let m = app.sim.latest().clone();
+    draw_metrics(ui, &m, x, pr.y + pr.h - 22.0 - 12.0 * 24.0 - 14.0, iw);
+}
+
+// ---------------------------------------------------------------- запуск
+
+struct Opts {
+    scenario: Scenario,
+    depth: f32,
+    view: Option<View>,
+    cut: bool,
+    top: bool,
+    cam: Option<(f32, f32, f32)>,
+    treat_tab: bool,
+    days: Option<f32>,
+    antiseptic: Option<Antiseptic>,
+    antibiotic_every: Option<f32>,
+    debride: Vec<f32>,
+    screenshot: Option<String>,
+}
+
+/// Для отладки и скриншотов: `--scenario`, `--depth`, `--view`, `--no-cut`, `--top`,
+/// `--cam yaw,pitch,dist`, `--treat`, `--days` (промотать), `--antiseptic`,
+/// `--antibiotic-every`, `--debride 1,3`, `--screenshot out.png`.
+fn parse_opts() -> Opts {
+    let mut o = Opts {
+        scenario: Scenario::Healthy,
+        depth: 2.5,
+        view: None,
+        cut: true,
+        top: false,
+        cam: None,
+        treat_tab: false,
+        days: None,
+        antiseptic: None,
+        antibiotic_every: None,
+        debride: Vec::new(),
+        screenshot: None,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--no-cut" => o.cut = false,
+            "--top" => o.top = true,
+            "--treat" => o.treat_tab = true,
+            _ => {
+                let v = args.next().unwrap_or_default();
+                match a.as_str() {
+                    "--scenario" => o.scenario = Scenario::parse(&v).unwrap_or(Scenario::Healthy),
+                    "--depth" => o.depth = v.parse().unwrap_or(2.5),
+                    "--view" => o.view = View::parse(&v),
+                    "--cam" => {
+                        let n: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+                        if n.len() == 3 {
+                            o.cam = Some((n[0], n[1], n[2]));
+                        }
+                    }
+                    "--days" => o.days = v.parse().ok(),
+                    "--antiseptic" => o.antiseptic = Antiseptic::parse(&v),
+                    "--antibiotic-every" => o.antibiotic_every = v.parse().ok(),
+                    "--debride" => o.debride = v.split(',').filter_map(|s| s.trim().parse().ok()).collect(),
+                    "--screenshot" => o.screenshot = Some(v),
+                    _ => eprintln!("неизвестная опция: {a}"),
+                }
+            }
+        }
+    }
+    o
+}
+
+fn window_conf() -> macroquad::conf::Conf {
+    macroquad::conf::Conf {
+        miniquad_conf: Conf {
+            window_title: "Симулятор регенерации кожи".to_owned(),
+            window_width: 1440,
+            window_height: 900,
+            window_resizable: false,
+            sample_count: 4,
+            ..Default::default()
+        },
+        // Меш поверхности — ~42 тыс. вершин за один вызов (индексы u16, поэтому < 65536).
+        draw_call_vertex_capacity: 60_000,
+        draw_call_index_capacity: 300_000,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
+async fn main() {
+    let opts = parse_opts();
+    let mut ui = Ui::load();
+    ui.inert = opts.screenshot.is_some();
+    let mut app = App::new(opts.scenario);
+    app.depth_mm = opts.depth;
+    app.reset();
+    app.view = opts.view;
+    app.cut = opts.cut;
+    if opts.treat_tab {
+        app.tab = Tab::Treatment;
+    }
+    if let Some(a) = opts.antiseptic {
+        app.agent = a;
+        app.set_dressing(Some(24.0));
+    }
+    if let Some(h) = opts.antibiotic_every {
+        app.set_antibiotic(Some(h));
+    }
+    if let Some(days) = opts.days {
+        let per_hour = app.sim.steps_per_hour();
+        for hour in 0..(days * 24.0).round() as usize {
+            if opts.debride.iter().any(|d| (d * 24.0).round() as usize == hour) {
+                app.debride();
+            }
+            app.sim.run_steps(per_hour);
+        }
+        app.playing = false;
+    }
+
+    let mut scene = Scene3D::new(GRID_W, GRID_H, app.sim.p.cell_mm);
+    if opts.top {
+        scene.cam = OrbitCam::top();
+    }
+    if let Some((yaw, pitch, dist)) = opts.cam {
+        scene.cam = OrbitCam { yaw, pitch, dist };
+    }
+
+    let mut frame = 0u32;
+    loop {
+        ui.begin();
+        if is_key_pressed(KeyCode::Space) {
+            app.playing = !app.playing;
+        }
+        if is_key_pressed(KeyCode::R) {
+            app.reset();
+        }
+        if is_key_pressed(KeyCode::Tab) {
+            app.cut = !app.cut;
+        }
+        if is_key_pressed(KeyCode::Right) && !app.playing {
+            let n = app.sim.steps_per_hour();
+            app.sim.run_steps(n);
+        }
+        camera_input(&ui, &mut app, &mut scene);
+        app.update(get_frame_time());
+
+        clear_background(ui::BG);
+        draw_header(&ui, &app);
+        let r = view_rect();
+        ui::fill_rounded(Rect::new(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0), 3.0, ui::BORDER);
+        let hovered = draw_tissue_3d(&ui, &mut app, &mut scene);
+        draw_legend_overlay(&ui, app.view);
+        draw_view_chips(&ui, &mut app, &mut scene);
+        let now = app.sim.hours();
+        chart::draw(
+            &ui,
+            Rect::new(20.0, 628.0, 960.0, 252.0),
+            &app.sim.history,
+            &app.sim.therapy.events,
+            &mut app.visible,
+            now,
+        );
+        draw_panel(&ui, &mut app);
+        if let Some(i) = hovered {
+            draw_tooltip(&ui, &app, i);
+        }
+
+        if let Some(path) = &opts.screenshot {
+            if frame == 3 {
+                get_screen_data().export_png(path);
+                break;
+            }
+        }
+        frame += 1;
+        next_frame().await;
+    }
+}
