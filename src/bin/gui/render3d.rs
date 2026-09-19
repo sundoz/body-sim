@@ -193,13 +193,22 @@ struct Face {
 
 impl Face {
     fn new(p: &Params, cells_along: usize, seed: u32) -> Self {
-        let geom = SectionGeom { w: cells_along * TEX_PX_PER_CELL, h: TEX_H, top_mm: TEX_TOP_MM, px_per_mm: TEX_PX_PER_MM };
+        let geom =
+            SectionGeom { w: cells_along * TEX_PX_PER_CELL, h: TEX_H, top_mm: TEX_TOP_MM, px_per_mm: TEX_PX_PER_MM };
         let mut base = vec![0u8; geom.w * geom.h * 4];
         paint::paint_base(p, cells_along, &geom, &mut base, seed);
         let tex = Texture2D::from_rgba8(geom.w as u16, geom.h as u16, &base);
         tex.set_filter(FilterMode::Linear);
         let rgba = base.clone();
-        Self { tex, rgba, base, geom, mesh: Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None }, seed, painted: None }
+        Self {
+            tex,
+            rgba,
+            base,
+            geom,
+            mesh: Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None },
+            seed,
+            painted: None,
+        }
     }
 
     /// Перерисовать срез по линии клеток, если сцена изменилась с прошлого раза.
@@ -280,7 +289,10 @@ fn shadow_mesh(hw: f32, hh: f32) -> Mesh {
 fn catmull(p0: f32, p1: f32, p2: f32, p3: f32, t: f32) -> f32 {
     let t2 = t * t;
     let t3 = t2 * t;
-    0.5 * ((2.0 * p1) + (-p0 + p2) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
+    0.5 * ((2.0 * p1)
+        + (-p0 + p2) * t
+        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+        + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
 }
 
 impl Scene3D {
@@ -363,10 +375,7 @@ impl Scene3D {
             let bot = r + (s - r) * fx;
             top + (bot - top) * fy
         };
-        let mut albedo = [0.0; 3];
-        for k in 0..3 {
-            albedo[k] = lerp(a.albedo[k], b.albedo[k], c.albedo[k], d.albedo[k]);
-        }
+        let albedo = std::array::from_fn(|k| lerp(a.albedo[k], b.albedo[k], c.albedo[k], d.albedo[k]));
         CellLook {
             albedo,
             wet: lerp(a.wet, b.wet, c.wet, d.wet),
@@ -415,7 +424,7 @@ impl Scene3D {
         let face_key = (revision, cut_row);
         // Передняя грань — раз в 3 кадра (ткань меняется плавно), при сдвиге среза — сразу.
         let cut_moved = self.front.painted.map(|k| k.1) != Some(cut_row);
-        if cut_moved || self.frame % 3 == 0 {
+        if cut_moved || self.frame.is_multiple_of(3) {
             let cells: Vec<usize> = (0..self.w).map(|x| cut_row * self.w + x).collect();
             self.front.repaint(t, p, &cells, face_key);
         }
@@ -548,7 +557,9 @@ impl Scene3D {
             right.push(vertex(vec3(xr, top_r, z), vec2(u, g.v_of_z(-top_r)), white, vec4(1.0, 0.0, 0.0, 0.0)));
             right.push(vertex(vec3(xr, bottom, z), vec2(u, g.v_of_z(-bottom)), white, vec4(1.0, 0.0, 0.0, 0.0)));
         }
-        for (face, verts) in [(&mut self.front, front), (&mut self.back, back), (&mut self.left, left), (&mut self.right, right)] {
+        for (face, verts) in
+            [(&mut self.front, front), (&mut self.back, back), (&mut self.left, left), (&mut self.right, right)]
+        {
             let n = verts.len() / 2;
             face.mesh.indices.clear();
             for k in 0..n - 1 {

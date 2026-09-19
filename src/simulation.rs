@@ -74,7 +74,7 @@ impl Simulation {
             self.therapy.tick(&mut self.tissue, &self.p, now);
             sim::step(&mut self.tissue, &self.p, &mut self.scratch);
             self.steps += 1;
-            if self.steps % per_hour == 0 {
+            if self.steps.is_multiple_of(per_hour) {
                 self.record();
             }
         }

@@ -124,8 +124,8 @@ pub fn draw(ui: &Ui, r: Rect, hist: &[Metrics], events: &[Event], visible: &mut 
     // Легенда серий — кликабельные «чипы», с переносом строк.
     let mut lx = r.x + 10.0;
     let mut ly = r.y + 32.0;
-    for i in 0..N {
-        let cw = ui.measure(NAMES[i], 12, false) + 24.0;
+    for (i, name) in NAMES.iter().enumerate() {
+        let cw = ui.measure(name, 12, false) + 24.0;
         if lx + cw > r.x + r.w - 10.0 {
             lx = r.x + 10.0;
             ly += 22.0;
@@ -147,7 +147,13 @@ pub fn draw(ui: &Ui, r: Rect, hist: &[Metrics], events: &[Event], visible: &mut 
         draw_line(plot.x, y, plot.x + plot.w, y, 1.0, ui::GRID);
         ui.text_right(&format!("{v:.2}"), plot.x - 8.0, y + 4.0, 11, ui::MUTED);
     }
-    let tick = if span <= 42 { 7 } else if span <= 120 { 14 } else { 30 };
+    let tick = if span <= 42 {
+        7
+    } else if span <= 120 {
+        14
+    } else {
+        30
+    };
     for d in (0..=span).step_by(tick) {
         let x = xd(d as f32);
         draw_line(x, plot.y, x, plot.y + plot.h, 1.0, ui::GRID);
@@ -212,7 +218,8 @@ pub fn draw(ui: &Ui, r: Rect, hist: &[Metrics], events: &[Event], visible: &mut 
         let bw = 214.0;
         let bh = 48.0 + rows.len() as f32 * 17.0;
         let bx = if x + 12.0 + bw > plot.x + plot.w { x - 12.0 - bw } else { x + 12.0 };
-        let by = (plot.y + plot.h - bh).min(plot.y + 4.0).max(r.y + 4.0);
+        // Прижимаем к низу графика, но не даём уехать выше его верхнего края.
+        let by = (plot.y + plot.h - bh).max(plot.y + 4.0);
         ui::fill_rounded(Rect::new(bx, by, bw, bh), 6.0, Color::new(0.05, 0.055, 0.07, 0.97));
         ui.bold(&format!("День {:.1} · {}", s.hours / 24.0, s.phase().title()), bx + 10.0, by + 19.0, 13, ui::TEXT);
         ui.text(s.condition().title(), bx + 10.0, by + 36.0, 12, condition_color(s.condition()));
@@ -272,6 +279,9 @@ mod tests {
             }
         }
         assert_ne!(condition_color(Condition::Healed), condition_color(Condition::Sepsis));
-        assert_eq!(event_color(EventKind::Dose(body_sim::therapy::Antibiotic::Cefazolin)), event_color(EventKind::Dose(body_sim::therapy::Antibiotic::Vancomycin)));
+        assert_eq!(
+            event_color(EventKind::Dose(body_sim::therapy::Antibiotic::Cefazolin)),
+            event_color(EventKind::Dose(body_sim::therapy::Antibiotic::Vancomycin))
+        );
     }
 }

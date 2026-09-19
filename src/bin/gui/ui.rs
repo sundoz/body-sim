@@ -26,10 +26,7 @@ pub struct Ui {
 }
 
 fn load_font(paths: &[&str]) -> Option<Font> {
-    paths
-        .iter()
-        .find_map(|p| std::fs::read(p).ok())
-        .and_then(|bytes| load_ttf_font_from_bytes(&bytes).ok())
+    paths.iter().find_map(|p| std::fs::read(p).ok()).and_then(|bytes| load_ttf_font_from_bytes(&bytes).ok())
 }
 
 impl Ui {
@@ -49,7 +46,16 @@ impl Ui {
             "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
         ])
         .or_else(|| regular.clone());
-        Self { regular, bold, mouse: Vec2::ZERO, clicked: false, down: false, right: false, inert: false, fake_mouse: None }
+        Self {
+            regular,
+            bold,
+            mouse: Vec2::ZERO,
+            clicked: false,
+            down: false,
+            right: false,
+            inert: false,
+            fake_mouse: None,
+        }
     }
 
     pub fn begin(&mut self) {
@@ -80,7 +86,11 @@ impl Ui {
     }
 
     fn font(&self, bold: bool) -> Option<&Font> {
-        if bold { self.bold.as_ref() } else { self.regular.as_ref() }
+        if bold {
+            self.bold.as_ref()
+        } else {
+            self.regular.as_ref()
+        }
     }
 
     /// Текст с базовой линией на `y`. Возвращает ширину.
@@ -134,7 +144,7 @@ impl Ui {
     /// Вкладка: подчёркнутый текст.
     pub fn tab(&self, r: Rect, label: &str, active: bool) -> bool {
         let hover = self.hovered(r);
-        let color = if active { TEXT } else if hover { TEXT } else { MUTED };
+        let color = if active || hover { TEXT } else { MUTED };
         let w = self.measure(label, 15, true);
         self.bold(label, r.x + (r.w - w) / 2.0, r.y + r.h / 2.0 + 5.0, 15, color);
         let line = if active { ACCENT } else { BORDER };

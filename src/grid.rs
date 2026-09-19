@@ -24,8 +24,7 @@ impl Field {
                 let lf = if x == 0 { 0 } else { x - 1 };
                 let rt = if x + 1 == w { x } else { x + 1 };
                 let c = d[y * w + x];
-                out[y * w + x] =
-                    d[up * w + x] + d[dn * w + x] + d[y * w + lf] + d[y * w + rt] - 4.0 * c;
+                out[y * w + x] = d[up * w + x] + d[dn * w + x] + d[y * w + lf] + d[y * w + rt] - 4.0 * c;
             }
         }
     }

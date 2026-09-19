@@ -331,8 +331,16 @@ impl Therapy {
 }
 
 /// Нанести антисептик на открытую поверхность раны.
+///
+/// Поле концентрации одно на все препараты, а вымывается оно по t½ текущего агента,
+/// поэтому новая повязка сначала смывает остатки прежней: иначе смена средства задним
+/// числом меняла бы скорость вымывания того, что уже лежит на ране (перекись с t½ = 0.3 ч
+/// вдруг начинала бы держаться шесть часов, как октенидин).
 pub fn apply_antiseptic(t: &mut Tissue, agent: Antiseptic) {
-    t.antiseptic_agent = agent;
+    if t.antiseptic_agent != agent {
+        t.antiseptic.data.fill(0.0);
+        t.antiseptic_agent = agent;
+    }
     for i in 0..t.len() {
         let open = t.epithelium.data[i] < 0.8 || t.slough.data[i] > 0.05;
         if t.wound_mask[i] && open {
@@ -489,6 +497,32 @@ mod tests {
         }
         assert!((t.antiseptic.data[c] - 0.5).abs() < 0.03);
         assert_eq!(th.events.len(), 1);
+    }
+
+    #[test]
+    fn switching_agent_washes_out_the_previous_one() {
+        let (mut t, p) = wounded();
+        let mut th = Therapy::default();
+        let c = (H / 2) * W + W / 2;
+        // Перекись держится на ране 0.3 ч; за 3 ч от неё почти ничего не остаётся.
+        th.apply_antiseptic_now(&mut t, Antiseptic::Peroxide, 0.0);
+        for k in 0..(3.0 / p.dt) as usize {
+            th.tick(&mut t, &p, k as f32 * p.dt);
+        }
+        let leftover = t.antiseptic.data[c];
+        assert!(leftover < 0.01, "перекись должна была вымыться: {leftover}");
+
+        // Смена агента не должна «воскрешать» остаток под чужим периодом полувыведения.
+        let mut t = Tissue::healthy(W, H, &p);
+        t.injure(WoundShape::Circle { radius: 6.0 }, 2.5, &p);
+        let mut th = Therapy::default();
+        th.apply_antiseptic_now(&mut t, Antiseptic::Peroxide, 0.0);
+        // Закрываем рану, чтобы новая повязка не легла на эту клетку заново.
+        t.epithelium.data[c] = 1.0;
+        t.slough.data[c] = 0.0;
+        th.apply_antiseptic_now(&mut t, Antiseptic::Octenidine, 0.0);
+        assert_eq!(t.antiseptic_agent, Antiseptic::Octenidine);
+        assert_eq!(t.antiseptic.data[c], 0.0, "остаток перекиси смыт новой повязкой");
     }
 
     #[test]
