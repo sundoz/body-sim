@@ -70,10 +70,11 @@ fn last(sim: &Simulation) -> &Metrics {
 // ---------------------------------------------------------------- заживление и глубина
 
 #[test]
-fn healthy_full_thickness_wound_heals_in_about_three_weeks() {
-    let s = untreated(Scenario::Healthy, 2.5, 30.0);
+fn healthy_full_thickness_wound_heals_in_three_to_five_weeks() {
+    // Полнослойная рана Ø8 мм вторичным натяжением: литература — 2–5 недель.
+    let s = untreated(Scenario::Healthy, 2.5, 40.0);
     let day = closed_day(&s).expect("здоровая рана должна зажить");
-    assert!((17.0..27.0).contains(&day), "эпителизация на {day:.1} день");
+    assert!((18.0..36.0).contains(&day), "эпителизация на {day:.1} день");
     assert!(worst(&s) <= Condition::Healing, "без осложнений");
     assert_eq!(last(&s).bacteria, 0.0);
     let peak_neut_day = s.history.iter().max_by(|a, b| a.neutrophils.total_cmp(&b.neutrophils)).unwrap().hours / 24.0;
@@ -86,7 +87,7 @@ fn deeper_wounds_heal_slower() {
         .iter()
         .map(|&d| closed_day(&untreated(Scenario::Healthy, d, 45.0)).expect("должна зажить"))
         .collect();
-    assert!(days[0] < 5.0, "ссадина — за несколько дней: {days:?}");
+    assert!((5.0..13.0).contains(&days[0]), "ссадина — за 1–1.5 недели: {days:?}");
     assert!(days.windows(2).all(|w| w[0] < w[1]), "чем глубже, тем дольше: {days:?}");
 }
 
@@ -140,10 +141,13 @@ fn fat_barely_regenerates_and_leaves_scar() {
 // ---------------------------------------------------------------- некроз и инфекция
 
 #[test]
-fn ischemia_causes_dry_necrosis_without_infection() {
-    let s = untreated(Scenario::Ischemic, 2.5, 10.0);
-    assert!(worst(&s) >= Condition::Necrosis);
-    assert_eq!(s.history.iter().map(|m| m.infected_mm2).fold(0.0, f32::max), 0.0);
+fn ischemia_causes_dry_necrosis_before_any_infection() {
+    // Ишемия убивает ткань сама по себе; инфекция если и приходит, то позже, на мёртвую ткань.
+    let s = untreated(Scenario::Ischemic, 2.5, 20.0);
+    let necrosis = first_day(&s, Condition::Necrosis).expect("ишемия должна дать некроз");
+    assert!(necrosis < 5.0, "некроз на {necrosis:.1} день");
+    let infection = s.history.iter().find(|m| m.infected_mm2 > 1.0).map_or(f32::INFINITY, |m| m.hours / 24.0);
+    assert!(necrosis < infection, "некроз {necrosis:.1} раньше инфекции {infection:.1}");
 }
 
 #[test]
@@ -236,11 +240,11 @@ fn vancomycin_kills_the_resistant_strain_better_than_cefazolin() {
 fn gentle_antiseptics_heal_faster_than_cytotoxic_ones() {
     let heal = |a: Antiseptic, every: f32| {
         let plan = Plan { antiseptic: Some((a, every)), ..Default::default() };
-        closed_day(&run(wound(Scenario::Infected, 2.5), 45.0, &plan)).unwrap_or(f32::INFINITY)
+        closed_day(&run(wound(Scenario::Infected, 2.5), 70.0, &plan)).unwrap_or(f32::INFINITY)
     };
     let octenidine = heal(Antiseptic::Octenidine, 24.0);
     let chlorhexidine = heal(Antiseptic::Chlorhexidine, 24.0);
-    let untreated = closed_day(&untreated(Scenario::Infected, 2.5, 45.0)).unwrap_or(f32::INFINITY);
+    let untreated = closed_day(&untreated(Scenario::Infected, 2.5, 70.0)).unwrap_or(f32::INFINITY);
     assert!(octenidine < chlorhexidine, "{octenidine} < {chlorhexidine}");
     assert!(octenidine < untreated, "антисептик помогает инфицированной ране: {octenidine} < {untreated}");
 }
@@ -249,9 +253,11 @@ fn gentle_antiseptics_heal_faster_than_cytotoxic_ones() {
 fn too_frequent_cytotoxic_antiseptic_delays_healing() {
     let heal = |every: f32| {
         let plan = Plan { antiseptic: Some((Antiseptic::PovidoneIodine, every)), ..Default::default() };
-        closed_day(&run(wound(Scenario::Infected, 2.5), 42.0, &plan)).unwrap_or(f32::INFINITY)
+        closed_day(&run(wound(Scenario::Infected, 2.5), 60.0, &plan)).unwrap_or(f32::INFINITY)
     };
-    assert!(heal(12.0) > heal(24.0));
+    let (daily, twice) = (heal(24.0), heal(12.0));
+    assert!(daily.is_finite(), "раз в сутки рана заживает: {daily}");
+    assert!(twice > daily, "{twice} > {daily}");
 }
 
 #[test]

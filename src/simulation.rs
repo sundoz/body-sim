@@ -137,9 +137,9 @@ mod tests {
     }
 
     #[test]
-    fn superficial_wound_closes_within_a_week_and_new_injury_reopens_it() {
+    fn superficial_wound_closes_within_two_weeks_and_new_injury_reopens_it() {
         let mut s = sim(0.1);
-        s.run_steps(7 * 24 * s.steps_per_hour());
+        s.run_steps(14 * 24 * s.steps_per_hour());
         assert!(s.closed_at.is_some());
         s.injure_disk(48.0, 24.0, 4.0, 1.0);
         assert!(s.closed_at.is_none());

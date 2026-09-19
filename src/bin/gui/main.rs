@@ -556,7 +556,7 @@ fn draw_treatment_tab(ui: &Ui, app: &mut App, x: f32, mut y: f32, iw: f32) {
         dots(pr.necro_pen)
     );
     ui.text(&info, x, y + 11.0, 12, ui::MUTED);
-    let tox = format!("токсичность: эпителий {} · фибробласты {}", dots(pr.tox_epi / 0.12), dots(pr.tox_fib / 0.12));
+    let tox = format!("токсичность: эпителий {} · фибробласты {}", dots(pr.tox_epi / 0.06), dots(pr.tox_fib / 0.06));
     ui.text(&tox, x, y + 27.0, 12, ui::MUTED);
     y += 34.0;
     if ui.button_sized(Rect::new(x, y, 130.0, 28.0), "Обработать", false, 14) {

@@ -143,6 +143,9 @@ pub struct Params {
     pub epi_bact_half: f32,
     /// Эпителий из придатков кожи (фолликулы, потовые железы) в неглубоких ранах.
     pub adnexal_rate: f32,
+    /// Как круто падает число придатков (фолликулов, желёз) с глубиной раны:
+    /// островков эпителия ∝ (доля уцелевшей дермы)^показатель.
+    pub adnexal_exponent: f32,
     /// До какой остаточной глубины полости эпителий может наползать.
     pub epi_level_mm: f32,
 
@@ -250,38 +253,39 @@ impl Default for Params {
 
             d_neut: 0.1,
             recruit_neut: 0.5,
-            death_neut: 0.03,
+            death_neut: 0.064,
             max_neut: 1.0,
             efferocytosis: 0.05,
 
             d_mac: 0.05,
-            recruit_mac: 0.05,
+            recruit_mac: 0.0772,
             max_mac: 1.0,
-            switch_m1_m2: 0.03,
+            switch_m1_m2: 0.0432,
             death_m1: 0.01,
-            death_m2: 0.008,
+            death_m2: 0.00742,
 
             d_fib: 0.1,
-            prolif_fib: 0.08,
+            prolif_fib: 0.0448,
             max_fib: 1.0,
             fib_baseline: 0.1,
-            fib_return: 0.02,
+            fib_return: 0.0072,
             bed_fib: 0.01,
-            fill_rate: 0.03,
+            fill_rate: 0.1,
 
-            collagen_rate: 0.015,
+            collagen_rate: 0.00636,
             collagen_degr_m1: 0.02,
             // τ ≈ 60 дней: ~20% прочности к 3-й неделе, ~50% к 3-му месяцу.
-            maturation_rate: 0.0007,
+            maturation_rate: 0.00152,
             scar_maturity_cap: 0.8,
 
             d_vessel: 0.05,
             angio_rate: 0.08,
 
-            d_epi: 0.03,
-            epi_rate: 0.12,
+            d_epi: 0.0404,
+            epi_rate: 0.0564,
             epi_bact_half: 0.1,
-            adnexal_rate: 0.002,
+            adnexal_rate: 0.00002,
+            adnexal_exponent: 5.9,
             epi_level_mm: 0.4,
 
             // Небольшая травма: 50% новых волокон к ~10-му дню, ~90% к 3–4 неделям.

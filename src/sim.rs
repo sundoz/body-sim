@@ -350,7 +350,7 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         // в неглубоких ранах он прорастает ещё и островками из придатков кожи.
         let level = 1.0 / (1.0 + ((depth - p.epi_level_mm).max(0.0) / 0.4).powi(2));
         let epi_scaffold = (cf + c).min(1.0) * level * (1.0 - block);
-        let islands = if wounded { p.residual_dermis(dmax) } else { 0.0 };
+        let islands = if wounded { p.residual_dermis(dmax).powf(p.adnexal_exponent) } else { 0.0 };
         // Во влажной среде (гидрогель) кератиноциты мигрируют быстрее.
         let moist = if gl.hydrogel { 1.3 } else { 1.0 };
         let d_epi = moist * (p.d_epi * s.epithelium[i]
