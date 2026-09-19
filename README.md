@@ -1,231 +1,240 @@
-# body-sim — симулятор регенерации тканей человека
+# body-sim — a human tissue regeneration simulator
 
 [![CI](https://github.com/sundoz/body-sim/actions/workflows/ci.yml/badge.svg)](https://github.com/sundoz/body-sim/actions/workflows/ci.yml)
 
-Заживление кожной раны на участке 24×12 мм: глубина до мышцы, некроз, инфекция,
-лечение антисептиками, антибиотиком и хирургической обработкой. Rust, графика на `macroquad`.
+Skin wound healing on a 24×12 mm patch: depth down to muscle, necrosis, infection,
+treatment with antiseptics, antibiotics and surgical debridement. Rust, graphics on `macroquad`.
 
-![Некротизирующая инфекция на 3-й день](docs/screenshot-necrotizing.png)
+> The user interface, code comments and CLI output are in Russian; this README is in English.
 
-## Графический режим
+![Necrotizing infection on day 3](docs/screenshot-necrotizing.png)
+
+## Graphical mode
 
 ```bash
 cargo run --release
 ```
 
-- **3D-блок ткани как в анатомическом атласе.** Рельефная поверхность: рана — настоящее
-  углубление, залитое кровью, слафом или грануляциями; кожа с порами и кожным рисунком
-  (у рубца их нет), влажный блеск раны, мягкое подповерхностное рассеяние, тонмаппинг.
-  Грани блока — срезы через слои с выносками: эпидермис, дерма с фолликулами, потовыми
-  железами и капиллярами, дольки жира, фасция, пучки мышечных волокон; в ране — сгусток,
-  мёртвая ткань, биоплёнка, отдельные бактерии и нейтрофилы. Плюс тепловые карты 18 полей
-  прямо на поверхности.
-- **Мышь**: ЛКМ — нанести рану выбранной глубины, ПКМ — вращать камеру, колесо — масштаб,
-  Shift+колесо — размер кисти, ↑/↓ — сдвинуть плоскость среза, Tab — срез вкл/выкл.
-  Наведение — все показатели точки.
-- **Вкладка «Пациент и рана»**: 7 сценариев, форма, размер и глубина раны.
-- **Вкладка «Лечение»**: 6 антисептиков с их профилем (сила, проникновение в биоплёнку и некроз,
-  токсичность для эпителия и фибробластов) — разовая обработка или перевязки раз в 12/24 ч;
-  3 системных антибиотика, которые можно комбинировать (доза раз в 8/12/24 ч, концентрации в плазме);
-  очищение от некроза — хирургия, гидрогель, коллагеназа, личинки.
-- **Шапка**: фаза заживления и клиническое состояние — заживает / хроническая / некроз /
-  распространяющаяся инфекция / сепсис.
-- **График**: 14 серий (включаются кликом по легенде), полосы фаз и состояния, засечки процедур.
-- Пробел — пауза, R — заново, → — шаг на 1 час при паузе.
-- Опции для отладки: `--scenario necrotizing --depth 5 --days 3 --cam 0.5,0.7,20 --top --no-cut
+- **A 3D tissue block styled like an anatomical atlas.** A relief surface: the wound is a real
+  depression filled with blood, slough or granulation tissue; skin with pores and skin markings
+  (a scar has neither), the wet sheen of a wound, soft subsurface scattering, tone mapping.
+  The faces of the block are sections through the layers with callouts: epidermis, dermis with
+  hair follicles, sweat glands and capillaries, fat lobules, fascia, muscle fibre bundles;
+  inside the wound — clot, dead tissue, biofilm, individual bacteria and neutrophils.
+  Plus heat maps of 18 fields drawn straight onto the surface.
+- **Mouse**: left button — inflict a wound of the selected depth, right button — orbit the camera,
+  wheel — zoom, Shift+wheel — brush size, ↑/↓ — move the cutting plane, Tab — section on/off.
+  Hovering shows every value at that point.
+- **"Patient and wound" tab**: 7 scenarios, wound shape, size and depth.
+- **"Treatment" tab**: 6 antiseptics with their profile (potency, penetration into biofilm and
+  necrosis, toxicity to epithelium and fibroblasts) — a single application or dressing changes
+  every 12/24 h; 3 systemic antibiotics that can be combined (a dose every 8/12/24 h, plasma
+  concentrations); debridement — surgery, hydrogel, collagenase, maggots.
+- **Header**: healing phase and clinical condition — healing / chronic / necrosis /
+  spreading infection / sepsis.
+- **Chart**: 14 series (toggled by clicking the legend), phase and condition bands, procedure marks.
+- Space — pause, R — restart, → — step one hour while paused.
+- Debug options: `--scenario necrotizing --depth 5 --days 3 --cam 0.5,0.7,20 --top --no-cut
   --treat --antibiotic-every 8 --debride 0.5,1.5 --screenshot out.png`.
-- Производительность: `--bench 300` — 300 кадров на максимальной скорости с таблицей времени по участкам.
-  Шаг модели и отрисовка срезов параллельны (`rayon`), сцена перестраивается только при изменении ткани;
-  на Ryzen 5 5600H — ~13 мс на кадр при 10 днях/с (60 FPS), 90 модельных дней в консоли — 3.7 с.
+- Performance: `--bench 300` — 300 frames at maximum speed with a per-section timing table.
+  The model step and section rendering run in parallel (`rayon`), and the scene is rebuilt only
+  when the tissue changes; on a Ryzen 5 5600H — ~13 ms per frame at 10 days/s (60 FPS),
+  90 simulated days in the console — 3.7 s.
 
-## Консольный режим
+## Console mode
 
 ```bash
 cargo run --release --bin body-sim -- --scenario diabetic-foot --depth 5 --days 42 --no-map
 cargo run --release --bin body-sim -- --scenario necrotizing --antibiotics cefazolin:8,clindamycin:8 --treat-from 0.5 --debride 0.5,1.5,3
 cargo run --release --bin body-sim -- --scenario infected --antiseptic hypochlorous --antiseptic-every 12
 cargo run --release --bin body-sim -- --scenario diabetic-foot --antibiotics vancomycin:12 --debriders larvae,hydrogel
-cargo run --release --bin body-sim -- --depth 9 --days 60 --no-map     # регенерация мышцы и жира
+cargo run --release --bin body-sim -- --depth 9 --days 60 --no-map     # muscle and fat regeneration
 cargo run --release --bin body-sim -- --help
 ```
 
-## Тесты
+## Tests
 
 ```bash
 cargo test
 ```
 
-92 теста, ~1 мин; CI (GitHub Actions) гоняет их на Ubuntu и Windows на каждый пуш,
-плюс `cargo fmt --check` и `cargo clippy -D warnings`.
-Покрытие модульными тестами: `cargo llvm-cov --release --lib --bins` (~20 с) — ядро модели 83–100%,
-всего 58% (не покрыты окно, кнопки и 3D-отрисовка, которым нужен GPU).
+92 tests, ~1 min; CI (GitHub Actions) runs them on Ubuntu and Windows on every push,
+plus `cargo fmt --check` and `cargo clippy -D warnings`.
+Unit test coverage: `cargo llvm-cov --release --lib --bins` (~20 s) — the model core is 83–100%,
+58% overall (the window, the buttons and the 3D rendering need a GPU and are not covered).
 
-Что проверяется: модульные тесты (лапласиан и сохранение вещества, анатомия колонки, нанесение раны,
-стационарность здоровой ткани, границы полей, детерминизм параллельного шага, фармакокинетика,
-антисептики, хирургия, метрики и классификация состояний, разбор аргументов, отрисовка срезов)
-и клиническая регрессия `tests/clinical.rs` — модель обязана воспроизводить известные исходы:
-сроки заживления по глубине, регенерацию мышцы и фиброз при большом дефекте, почти полное
-отсутствие регенерации жира, сухой некроз при ишемии, сепсис при нелеченой некротизирующей
-инфекции, излечение ранней хирургией, отбор устойчивости, эффект клиндамицина и ванкомицина,
-вред частых цитотоксичных антисептиков; `tests/literature.rs` — параметры по умолчанию воспроизводят
-литературные ориентиры калибровки.
+What is checked: unit tests (the Laplacian and conservation of mass, the anatomy of a tissue
+column, inflicting a wound, the stationarity of healthy tissue, field bounds, determinism of the
+parallel step, pharmacokinetics, antiseptics, surgery, metrics and condition classification,
+argument parsing, section rendering) and the clinical regression in `tests/clinical.rs` — the model
+is required to reproduce known outcomes: healing times by depth, muscle regeneration and fibrosis
+after a large defect, the near-absence of fat regeneration, dry necrosis under ischemia, sepsis in
+untreated necrotizing infection, cure by early surgery, selection for resistance, the effect of
+clindamycin and vancomycin, the harm of frequent cytotoxic antiseptics; `tests/literature.rs` —
+the default parameters reproduce the calibration targets from the literature.
 
-## Подход
+## Approach
 
-Регенерацию целого тела сразу не смоделировать, поэтому начинаем с одной ткани — кожи —
-и строим ядро так, чтобы потом добавлять ткани и масштабы.
+Regeneration of a whole body cannot be modelled in one go, so we start with a single tissue — skin —
+and build the core so that further tissues and scales can be added later.
 
-**Континуальная модель «2.5D».** Сетка 96×48 клеток по 0.25 мм (вид сверху). Каждая клетка —
-колонка ткани: эпидермис 0.1 мм → дерма 2 мм → жировая клетчатка 6 мм → фасция → мышца.
-В клетке хранятся плотности клеток и концентрации сигналов, а также глубина дефекта,
-максимальная глубина поражения и толщина мёртвой ткани. Полный 3D (воксели по глубине)
-понадобится для карманов и затёков под краями раны — пока не нужен.
+**A continuum "2.5D" model.** A grid of 96×48 cells of 0.25 mm (seen from above). Each cell is a
+column of tissue: epidermis 0.1 mm → dermis 2 mm → subcutaneous fat 6 mm → fascia → muscle.
+A cell stores cell densities and signal concentrations, plus the depth of the defect, the deepest
+level the damage has reached, and the thickness of dead tissue. Full 3D (voxels through the depth)
+will be needed for undermining and tracking under the wound edges — not yet.
 
-### Что моделируется
+### What is modelled
 
-| Процесс | Как |
+| Process | How |
 |---|---|
-| Гемостаз | кровотечение (сильнее в глубоких ранах) → сгусток → тромбоцитарные факторы роста |
-| Воспаление | дебрис, бактерии, некроз, биоплёнка → сигнал → нейтрофилы и макрофаги M1; эффероцитоз переключает M1→M2 |
-| Глубина | в неглубоких ранах уцелевшая дерма даёт островки эпителия из фолликулов и почти не оставляет рубца; глубокие сначала заполняются грануляциями, и только потом эпителизируются; клетчатка плохо кровоснабжается |
-| Кислород | от сосудов и дна раны; воспаление расширяет сосуды (гиперемия) — если артерии на это способны |
-| Некроз | ткань гибнет от гипоксии и бактериальных токсинов; мёртвая ткань блокирует заживление, кормит бактерии и недоступна иммунитету и антибиотику; макрофаги медленно её растворяют |
-| Инфекция | рост на открытой поверхности и в некрозе (инвазивные штаммы — и в живой ткани); биоплёнка прячет бактерии; фоновая защита живой ткани; некротизирующие штаммы выделяют лейкоцидины и диффундирующие экзотоксины, которые убивают ткань впереди бактерий |
-| Антисептики | октенидин, полигексанид, гипохлорит, хлоргексидин, повидон-йод, перекись: сила, проникновение в биоплёнку и некроз, инактивация органикой (гной, некроз), время удержания на ткани, раздельная токсичность для кератиноцитов и фибробластов (порядок — по in vitro данным: гипохлорит < PHMB ≈ октенидин < хлоргексидин ≈ йод < перекись) |
-| Антибиотики | цефазолин (быстрый β-лактам), клиндамицин (бактериостатик, хорошо проникает — даже в некроз — и подавляет синтез токсинов), ванкомицин (медленный, плохо проникает, но убивает штамм, устойчивый к β-лактамам); у каждого своя фармакокинетика, эффект по Хиллу от МПК; в ткань приходят с кровью; их можно комбинировать |
-| Очищение от некроза | хирургия — сразу (иссечение некроза и инфицированной ткани, рана становится больше); личинки — 1–2 недели (избирательно едят некроз и бактерии в нём); коллагеназа — дни–недели; гидрогель — ускоряет собственный аутолиз, размягчает сухой струп и ускоряет эпителизацию во влажной среде |
-| Мышца | клетки-сателлиты строят новые волокна: при небольшом дефекте ~50% к 7–8-му дню и ~75–80% к 3–4 неделям; способность экспоненциально падает с объёмом потери (volumetric muscle loss) — большой дефект рубцуется; инфекция, некроз и ишемия сдвигают исход к фиброзу |
-| Жир | во взрослой ране почти не возвращается (адипоциты появляются лишь около новых фолликулов): несколько процентов за 1–2 месяца, остальное — фиброзный рубец и вдавление на месте заживления |
-| Ремоделирование | созревание коллагена; рубец не прочнее ~84% здоровой кожи |
+| Hemostasis | bleeding (heavier in deep wounds) → clot → platelet-derived growth factors |
+| Inflammation | debris, bacteria, necrosis, biofilm → signal → neutrophils and M1 macrophages; efferocytosis switches M1→M2 |
+| Depth | in shallow wounds the surviving dermis provides epithelial islands from the follicles and leaves almost no scar; deep ones first fill with granulation tissue and only then epithelialize; fat is poorly perfused |
+| Oxygen | from the vessels and the wound bed; inflammation dilates the vessels (hyperemia) — if the arteries are able to |
+| Necrosis | tissue dies from hypoxia and bacterial toxins; dead tissue blocks healing, feeds bacteria and is out of reach of the immune system and antibiotics; macrophages dissolve it slowly |
+| Infection | growth on the open surface and in necrosis (invasive strains — in living tissue too); biofilm hides bacteria; living tissue has a background defence; necrotizing strains release leukocidins and diffusing exotoxins that kill tissue ahead of the bacteria |
+| Antiseptics | octenidine, polyhexanide, hypochlorous acid, chlorhexidine, povidone-iodine, hydrogen peroxide: potency, penetration into biofilm and necrosis, inactivation by organic matter (pus, necrosis), residence time on the tissue, separate toxicity to keratinocytes and fibroblasts (the ordering follows in vitro data: hypochlorous acid < PHMB ≈ octenidine < chlorhexidine ≈ iodine < peroxide) |
+| Antibiotics | cefazolin (a fast β-lactam), clindamycin (bacteriostatic, penetrates well — into necrosis too — and suppresses toxin synthesis), vancomycin (slow, penetrates poorly, but kills the β-lactam-resistant strain); each has its own pharmacokinetics and a Hill effect on MIC; they reach the tissue with the blood; they can be combined |
+| Debridement | surgery — immediate (excision of necrosis and infected tissue, the wound gets larger); maggots — 1–2 weeks (they eat necrosis and the bacteria in it selectively); collagenase — days to weeks; hydrogel — speeds up autolysis, softens dry eschar and speeds up epithelialization in a moist environment |
+| Muscle | satellite cells build new fibres: after a small defect ~50% by day 7–8 and ~75–80% by weeks 3–4; the capacity falls exponentially with the volume lost (volumetric muscle loss) — a large defect scars instead; infection, necrosis and ischemia shift the outcome towards fibrosis |
+| Fat | barely returns in an adult wound (adipocytes appear only near new follicles): a few per cent over 1–2 months, the rest is fibrous scar and a contour depression where the wound healed |
+| Remodeling | collagen maturation; a scar is never stronger than ~84% of healthy skin |
 
-## Калибровка
+## Calibration
 
-Параметры откалиброваны по литературным данным: `cargo run --release --bin calibrate [итераций] [с этапа]`
-(Нелдер–Мид в логарифмическом пространстве параметров с границами; ~15 мин на все этапы).
-Ошибка — сумма квадратов отклонений в единицах допуска. Тест `tests/literature.rs` следит,
-чтобы параметры по умолчанию не уходили от ориентиров.
+The parameters are calibrated against published data: `cargo run --release --bin calibrate [iterations] [from stage]`
+(Nelder–Mead in a logarithmic parameter space with bounds; ~15 min for all stages).
+The error is the sum of squared deviations in units of the tolerance. The test `tests/literature.rs`
+makes sure the default parameters do not drift away from the targets.
 
-| Наблюдение | Литература | До калибровки | После |
+| Observation | Literature | Before calibration | After |
 |---|---|---|---|
-| пик нейтрофилов | 1 ± 0.5 дня | 1.17 | 0.96 |
-| пик макрофагов | 2.5 ± 0.75 дня | 2.67 | 2.50 |
-| нейтрофилы на 7-й день / пик | 0.1 ± 0.1 | 0.22 | 0.10 |
-| пик фибробластов | 10 ± 3 дня | 8.2 | 10.0 |
-| эпителизация ссадины 0.1 мм | 8 ± 3 дня | 2.4 | 9.0 |
-| эпителизация донорского места 0.3 мм | 12 ± 4 дня | 2.4 | 9.9 |
-| эпителизация дермальной раны 1 мм | 21 ± 6 дней | 4.7 | 15.1 |
-| эпителизация полнослойной раны 2.5 мм | 24 ± 6 дней | 20.5 | 28.5 |
-| прочность рубца на 7-й день | ~0.03 | 0.10 | 0.07 |
-| прочность на 21-й день | 0.20 ± 0.07 | 0.27 | 0.23 |
-| прочность на 42-й день | 0.40 ± 0.10 | 0.41 | 0.41 |
-| прочность на 90-й день | 0.62 ± 0.08 | 0.60 | 0.58 |
+| neutrophil peak | 1 ± 0.5 days | 1.17 | 0.96 |
+| macrophage peak | 2.5 ± 0.75 days | 2.67 | 2.50 |
+| neutrophils on day 7 / peak | 0.1 ± 0.1 | 0.22 | 0.10 |
+| fibroblast peak | 10 ± 3 days | 8.2 | 10.0 |
+| epithelialization of a 0.1 mm abrasion | 8 ± 3 days | 2.4 | 9.0 |
+| epithelialization of a 0.3 mm graft donor site | 12 ± 4 days | 2.4 | 9.9 |
+| epithelialization of a 1 mm deep dermal wound | 21 ± 6 days | 4.7 | 15.1 |
+| epithelialization of a 2.5 mm full-thickness wound | 24 ± 6 days | 20.5 | 28.5 |
+| scar strength on day 7 | ~0.03 | 0.10 | 0.07 |
+| strength on day 21 | 0.20 ± 0.07 | 0.27 | 0.23 |
+| strength on day 42 | 0.40 ± 0.10 | 0.41 | 0.41 |
+| strength on day 90 | 0.62 ± 0.08 | 0.60 | 0.58 |
 
-Что изменилось: нейтрофилы живут вдвое короче, макрофаги приходят быстрее, фибробласты делятся
-медленнее; эпителий растёт вдвое медленнее, островки эпителия из придатков кожи резко редеют с глубиной;
-коллаген откладывается медленнее, но быстрее созревает. Токсичность антисептиков пересчитана
-относительно новых скоростей обновления клеток.
+What changed: neutrophils live half as long, macrophages arrive sooner, fibroblasts divide more
+slowly; the epithelium grows half as fast, and epithelial islands from the skin appendages thin out
+sharply with depth; collagen is deposited more slowly but matures faster. Antiseptic toxicity was
+rescaled against the new cell turnover rates.
 
-Ориентиры: фазы заживления ([PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC2933384/),
+Sources: healing phases ([PMC](https://pmc.ncbi.nlm.nih.gov/articles/PMC2933384/),
 [Healogics](https://www.healogics.com/wound-care-patient-information/understanding-the-stages-of-wound-healing-from-inflammation-to-remodeling/)),
-эпителизация донорских мест и ссадин ([систематический обзор](https://www.sciencedirect.com/science/article/pii/S0305417921000504),
+epithelialization of donor sites and abrasions ([systematic review](https://www.sciencedirect.com/science/article/pii/S0305417921000504),
 [ScienceDirect Topics](https://www.sciencedirect.com/topics/pharmacology-toxicology-and-pharmaceutical-science/skin-abrasion)),
-прочность рубца (Levenson и др., 1965; [PRS Global Open](https://journals.lww.com/prsgo/fulltext/2013/04000/the_role_of_wound_healing_and_its_everyday.4.aspx)).
+scar strength (Levenson et al., 1965; [PRS Global Open](https://journals.lww.com/prsgo/fulltext/2013/04000/the_role_of_wound_healing_and_its_everyday.4.aspx)).
 
-### Результаты (здоровый пациент, рана Ø8 мм)
+### Results (healthy patient, Ø8 mm wound)
 
-| Глубина | Эпителизация | Прочность на 90-й день |
+| Depth | Epithelialization | Strength on day 90 |
 |---|---|---|
-| 0.1 мм — эпидермис | 9 дн. | 100% |
-| 1 мм — дерма | 15 дн. | 77% |
-| 2.5 мм — полнослойная | 28.5 дн. | 57% |
-| 5 мм — клетчатка | 31 дн. | 57% |
-| 9 мм — мышца | 31 дн. | 59% |
+| 0.1 mm — epidermis | 9 d | 100% |
+| 1 mm — dermis | 15 d | 77% |
+| 2.5 mm — full thickness | 28.5 d | 57% |
+| 5 mm — subcutaneous fat | 31 d | 57% |
+| 9 mm — muscle | 31 d | 59% |
 
-Глубокие слои: при ране 9 мм (утрачено 0.6 мм мышцы) — 82% новых волокон и 18% фиброза; при ране 12 мм
-(3.6 мм мышцы) фиброз преобладает. Клетчатка: к 90-му дню возвращается ~18% жира, на месте остального —
-рубец и вдавление.
+Deep layers: with a 9 mm wound (0.6 mm of muscle lost) — 82% new fibres and 18% fibrosis; with a
+12 mm wound (3.6 mm of muscle) fibrosis dominates. Fat: ~18% comes back by day 90, and in place of
+the rest there is scar and a contour depression.
 
-### Сценарии без лечения (глубина 2.5 мм, 90 дней)
+### Scenarios without treatment (depth 2.5 mm, 90 days)
 
-| Сценарий | Исход |
+| Scenario | Outcome |
 |---|---|
-| healthy | зажила за 28.5 дня |
-| elderly | 37.7 дня |
-| diabetic | хроническая, зажила за 88.8 дня |
-| infected | биоплёнка, хроническая, зажила за 61 день |
-| ischemic | сухой некроз дна с 2.5 дня, позже — вторичная инфекция, не заживает |
-| diabetic-foot | некроз + инфекция, не заживает |
-| necrotizing | распространение с 2.2 дня, сепсис с 6.1 дня |
+| healthy | healed in 28.5 days |
+| elderly | 37.7 days |
+| diabetic | chronic, healed in 88.8 days |
+| infected | biofilm, chronic, healed in 61 days |
+| ischemic | dry necrosis of the bed from day 2.5, later a secondary infection, never heals |
+| diabetic-foot | necrosis + infection, never heals |
+| necrotizing | spreading from day 2.2, sepsis from day 6.1 |
 
-### Антисептики (инфицированная рана, 90 дней; без лечения — 61 день)
+### Antiseptics (infected wound, 90 days; 61 days without treatment)
 
-| Антисептик | раз в 24 ч | раз в 12 ч |
+| Antiseptic | every 24 h | every 12 h |
 |---|---|---|
-| гипохлорит | 44 дн. (быстро расходуется) | **33.5 дн.** |
-| полигексанид | 35.9 дн. | 42.5 дн. |
-| октенидин | 39.3 дн. | 60.4 дн. |
-| повидон-йод | 41.7 дн. | не закрылась |
-| хлоргексидин | 62 дн. — не лучше, чем без лечения | не закрылась |
-| перекись | 56.7 дн. | 56.2 дн. |
+| hypochlorous acid | 44 d (consumed quickly) | **33.5 d** |
+| polyhexanide | 35.9 d | 42.5 d |
+| octenidine | 39.3 d | 60.4 d |
+| povidone-iodine | 41.7 d | never closed |
+| chlorhexidine | 62 d — no better than no treatment | never closed |
+| hydrogen peroxide | 56.7 d | 56.2 d |
 
-Частая обработка цитотоксичными антисептиками тормозит заживление сильнее, чем помогает.
+Frequent application of cytotoxic antiseptics holds healing back more than it helps.
 
-### Антибиотики и очищение от некроза (90 дней)
+### Antibiotics and debridement (90 days)
 
-| Случай | Исход |
+| Case | Outcome |
 |---|---|
-| necrotizing + только цефазолин | сепсис с 8.5 дня, 79% бактерий устойчивы |
-| necrotizing + цефазолин + клиндамицин | распространение отложено до 7.6 дня, но без хирургии сепсис к 25-му |
-| necrotizing + ранняя хирургия (0.5, 1.5, 3 дн.) + цефазолин + клиндамицин | зажила за 27.2 дня |
-| necrotizing + поздняя хирургия (3, 4 дн.) | рецидив некроза, сепсис к 17.5 дню |
-| diabetic-foot + только цефазолин | некроз не уходит, 58% бактерий устойчивы |
-| diabetic-foot + только ванкомицин | некроз не уходит: без очищения антибиотик не помогает |
-| diabetic-foot + хирургия + октенидин + антибиотик | инфекция и некроз убраны, рана хроническая из-за ишемии |
-| ischemic + гидрогель | сухая гангрена остаётся: кровоток не восстановлен |
-## Архитектура
+| necrotizing + cefazolin alone | sepsis from day 8.5, 79% of the bacteria resistant |
+| necrotizing + cefazolin + clindamycin | spreading delayed to day 7.6, but without surgery sepsis by day 25 |
+| necrotizing + early surgery (days 0.5, 1.5, 3) + cefazolin + clindamycin | healed in 27.2 days |
+| necrotizing + late surgery (days 3, 4) | necrosis recurs, sepsis by day 17.5 |
+| diabetic-foot + cefazolin alone | the necrosis stays, 58% of the bacteria resistant |
+| diabetic-foot + vancomycin alone | the necrosis stays: without debridement an antibiotic does not help |
+| diabetic-foot + surgery + octenidine + an antibiotic | infection and necrosis cleared, the wound stays chronic because of the ischemia |
+| ischemic + hydrogel | dry gangrene remains: blood flow was never restored |
+
+## Architecture
 
 ```
 src/
-  lib.rs         библиотека body_sim — ядро модели
-  params.rs      константы модели, анатомия колонки, 7 клинических сценариев
-  grid.rs        Field — скалярное поле на сетке, лапласиан (граница Неймана)
-  tissue.rs      Tissue — состояние участка ткани, нанесение раны заданной глубины
-  sim.rs         один шаг модели: явный Эйлер, dt = 0.1 ч
-  therapy.rs     антисептики, антибиотики (ФК/ФД), очищение от некроза, журнал процедур
-  calibration.rs калибровка: литературные ориентиры, этапы, оптимизатор Нелдера–Мида
-  bin/calibrate.rs  запуск калибровки
-  simulation.rs  прогон во времени: ткань + лечение + почасовая история метрик
-  report.rs      метрики, фаза, клиническое состояние, ASCII-карта, CSV
-  main.rs        консольный бинарник
-  bin/gui/       графический бинарник (macroquad)
-    main.rs      состояние приложения, раскладка, вкладки, ввод, камера
-    render3d.rs  3D-сцена: меш поверхности, грани-срезы, GLSL-шейдер кожи, орбитальная камера, выбор точки лучом
-    paint.rs     внешний вид ткани: цвет/влажность/рельеф поверхности, гистологические текстуры срезов
-    chart.rs     график динамики с полосами фаз/состояния и отметками процедур
-    ui.rs        кнопки, вкладки, панели, кириллический шрифт из системы
-    prof.rs      покадровый профайлер для `--bench`
+  lib.rs         the body_sim library — the model core
+  params.rs      model constants, the anatomy of a column, 7 clinical scenarios
+  grid.rs        Field — a scalar field on the grid, Laplacian (Neumann boundary)
+  tissue.rs      Tissue — the state of a tissue patch, inflicting a wound of a given depth
+  sim.rs         one model step: explicit Euler, dt = 0.1 h
+  therapy.rs     antiseptics, antibiotics (PK/PD), debridement, a log of procedures
+  calibration.rs calibration: literature targets, stages, the Nelder–Mead optimizer
+  bin/calibrate.rs  runs the calibration
+  simulation.rs  the run over time: tissue + treatment + an hourly history of metrics
+  report.rs      metrics, phase, clinical condition, ASCII map, CSV
+  main.rs        the console binary
+  bin/gui/       the graphical binary (macroquad)
+    main.rs      application state, layout, tabs, input, camera
+    render3d.rs  the 3D scene: surface mesh, section faces, the GLSL skin shader, orbit camera, ray picking
+    paint.rs     how the tissue looks: surface colour/wetness/relief, histological section textures
+    chart.rs     the timeline chart with phase/condition bands and procedure marks
+    ui.rs        buttons, tabs, panels, a Cyrillic font taken from the system
+    prof.rs      the per-frame profiler for `--bench`
 ```
 
-## Известные ограничения
+## Known limitations
 
-- Калибровка — по литературным ориентирам для здоровой кожи; параметры сценариев (диабет, ишемия,
-  инфекция) и лечения подобраны качественно. Два параметра эпителизации упёрлись в границы
-  (заполнение полости — максимум, островки из придатков — почти ноль): для раны Ø8 мм эпителий
-  наползает в основном с краёв, большие поверхностные ссадины модель, вероятно, заживляет медленнее.
-- Некротизирующая инфекция лечится одной ранней хирургией даже без антибиотика — в реальности нужны оба.
-- Один устойчивый штамм (к β-лактамам); нет других механизмов устойчивости и побочных эффектов антибиотиков.
-- Регенерация мышцы и жира описана долями восстановленного объёма в колонке, без отдельных волокон и долек.
-- Нет контракции раны, механики, отёка, давления (пролежни), реваскуляризации при ишемии.
-- Нет системного уровня: сепсис — это оценка площади инфекции, а не модель организма.
-- Клетки — не агенты: нет хемотаксиса и направленной миграции.
+- The calibration uses literature targets for healthy skin; the parameters of the scenarios
+  (diabetes, ischemia, infection) and of the treatments were chosen qualitatively. Two
+  epithelialization parameters ran into their bounds (cavity filling at the maximum, appendage
+  islands at almost zero): for a Ø8 mm wound the epithelium advances mostly from the edges, so the
+  model probably heals large superficial abrasions more slowly than it should.
+- Necrotizing infection is cured by a single early operation even without an antibiotic — in
+  reality both are needed.
+- One resistant strain (to β-lactams); no other resistance mechanisms and no antibiotic side effects.
+- Muscle and fat regeneration are described as fractions of the volume restored in a column,
+  without individual fibres and lobules.
+- No wound contraction, mechanics, edema, pressure (pressure ulcers) or revascularization
+  in ischemia.
+- No systemic level: sepsis here is an estimate of the infected area, not a model of the organism.
+- Cells are not agents: no chemotaxis and no directed migration.
 
 ## Roadmap
 
-1. ~~**Калибровка** по литературным кривым~~ — сделано (клетки, эпителизация, прочность рубца); дальше —
-   калибровка сценариев (диабет, ишемия) и лечения по клиническим исследованиям.
-2. **Лечение дальше**: NPWT (вакуум), реваскуляризация при ишемии, кожная пластика, побочные эффекты препаратов.
-3. ~~**CI**: прогон `cargo test` на каждый пуш~~ — сделано (GitHub Actions + покрытие).
-4. **Системный уровень**: температура, лейкоциты, лактат, SOFA — сепсис как состояние пациента.
-5. **Механика**: миофибробласты, контракция, качество рубца.
-6. **Гибридная модель**: агентные клетки поверх полей.
-7. **3D** и производительность: `rayon`, затем `wgpu` compute.
+1. ~~**Calibration** against literature curves~~ — done (cells, epithelialization, scar strength);
+   next — calibrating the scenarios (diabetes, ischemia) and the treatments against clinical studies.
+2. **More treatment**: NPWT (negative pressure), revascularization in ischemia, skin grafting,
+   drug side effects.
+3. ~~**CI**: run `cargo test` on every push~~ — done (GitHub Actions + coverage).
+4. **Systemic level**: temperature, white cell count, lactate, SOFA — sepsis as a state of the patient.
+5. **Mechanics**: myofibroblasts, contraction, scar quality.
+6. **A hybrid model**: agent-based cells on top of the fields.
+7. **3D** and performance: `rayon`, then `wgpu` compute.
