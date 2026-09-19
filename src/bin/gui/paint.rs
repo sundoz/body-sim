@@ -81,13 +81,7 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 
 /// Перцептивно ровная палитра в духе inferno.
 pub fn colormap(v: f32) -> Rgb {
-    const STOPS: [Rgb; 5] = [
-        rgb(4, 5, 18),
-        rgb(70, 16, 105),
-        rgb(186, 54, 85),
-        rgb(249, 142, 9),
-        rgb(252, 255, 164),
-    ];
+    const STOPS: [Rgb; 5] = [rgb(4, 5, 18), rgb(70, 16, 105), rgb(186, 54, 85), rgb(249, 142, 9), rgb(252, 255, 164)];
     let x = v.clamp(0.0, 1.0) * (STOPS.len() - 1) as f32;
     let k = (x.floor() as usize).min(STOPS.len() - 2);
     mix(STOPS[k], STOPS[k + 1], x - k as f32)
@@ -96,7 +90,8 @@ pub fn colormap(v: f32) -> Rgb {
 // ---------------------------------------------------------------- шум
 
 fn hash_u(x: i32, y: i32, seed: u32) -> u32 {
-    let mut h = (x as u32).wrapping_mul(374_761_393) ^ (y as u32).wrapping_mul(668_265_263) ^ seed.wrapping_mul(2_246_822_519);
+    let mut h =
+        (x as u32).wrapping_mul(374_761_393) ^ (y as u32).wrapping_mul(668_265_263) ^ seed.wrapping_mul(2_246_822_519);
     h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
     h ^ (h >> 16)
 }
@@ -189,7 +184,8 @@ pub fn surface_z(t: &Tissue, p: &Params, i: usize) -> f32 {
     let inflamed = (0.8 * t.neutrophils.data[i] + t.bacteria_total(i)).min(1.0) * e;
     let dmax = t.depth_max.data[i];
     let healed = (1.0 - t.depth.data[i] / 0.3).clamp(0.0, 1.0) * t.collagen.data[i];
-    let missing = p.lost_fat_mm(dmax) * (1.0 - t.fat_new.data[i]) + 0.5 * p.lost_muscle_mm(dmax) * t.muscle_scar.data[i];
+    let missing =
+        p.lost_fat_mm(dmax) * (1.0 - t.fat_new.data[i]) + 0.5 * p.lost_muscle_mm(dmax) * t.muscle_scar.data[i];
     open * (1.0 - fill) - 0.25 * inflamed + p.atrophy * missing * healed
 }
 
@@ -294,7 +290,13 @@ fn native_layer(p: &Params, u: f32, z: f32, v: f32, seed: u32) -> Rgb {
     let fat = p.fat_bottom_mm();
     let grain = fbm(u * 3.0, z * 3.0, seed);
     if z < p.epidermis_mm {
-        return if z < 0.025 { CORNEUM } else if z > 0.08 { scale(EPIDERMIS, 0.85) } else { EPIDERMIS };
+        return if z < 0.025 {
+            CORNEUM
+        } else if z > 0.08 {
+            scale(EPIDERMIS, 0.85)
+        } else {
+            EPIDERMIS
+        };
     }
     if z < skin {
         // Волосяной фолликул: наклонная трубка с волосом и луковицей.
@@ -371,7 +373,28 @@ struct Column {
 impl Column {
     /// Нетронутая кожа — такой столбец берётся из готовой анатомической подложки.
     fn intact(u: f32) -> Self {
-        Self { u, depth: 0.0, dmax: 0.0, slough: 0.0, e: 1.0, c: 1.0, q: 1.0, v: 1.0, f: 0.1, cf: 0.0, bl: 0.0, nt: 0.0, bf: 0.0, bt: 0.0, top: 0.0, myo: 0.0, mscar: 0.0, fat_new: 0.0, moist: false, larvae: false }
+        Self {
+            u,
+            depth: 0.0,
+            dmax: 0.0,
+            slough: 0.0,
+            e: 1.0,
+            c: 1.0,
+            q: 1.0,
+            v: 1.0,
+            f: 0.1,
+            cf: 0.0,
+            bl: 0.0,
+            nt: 0.0,
+            bf: 0.0,
+            bt: 0.0,
+            top: 0.0,
+            myo: 0.0,
+            mscar: 0.0,
+            fat_new: 0.0,
+            moist: false,
+            larvae: false,
+        }
     }
 
     fn is_quiet(&self) -> bool {

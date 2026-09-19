@@ -89,9 +89,33 @@ macro_rules! chunked_fields {
 }
 
 chunked_fields!(
-    antibiotic, antiseptic, bacteria, bacteria_res, biofilm, bleeding, clot, collagen, debris, depth,
-    depth_max, epithelium, fibroblasts, growth_factor, m1, m2, maturity, neutrophils, oxygen, signal,
-    slough, vegf, vessels, myo, muscle_scar, fat_new, toxin,
+    antibiotic,
+    antiseptic,
+    bacteria,
+    bacteria_res,
+    biofilm,
+    bleeding,
+    clot,
+    collagen,
+    debris,
+    depth,
+    depth_max,
+    epithelium,
+    fibroblasts,
+    growth_factor,
+    m1,
+    m2,
+    maturity,
+    neutrophils,
+    oxygen,
+    signal,
+    slough,
+    vegf,
+    vessels,
+    myo,
+    muscle_scar,
+    fat_new,
+    toxin,
 );
 
 /// Всё, что шаг берёт из состояния ткани целиком (лечение).
@@ -238,7 +262,8 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         let frac_r = if bt > 1e-6 { br / bt } else { 0.0 };
         let d_bact = p.d_bact * s.bacteria[i] + grow_s - mutate - (immune + as_kill + abx_kill_s + larvae_kill) * b
             + shed * (1.0 - frac_r);
-        let d_bact_res = p.d_bact * s.bacteria_res[i] + grow_r + mutate - (immune + as_kill + abx_kill_r + larvae_kill) * br
+        let d_bact_res = p.d_bact * s.bacteria_res[i] + grow_r + mutate
+            - (immune + as_kill + abx_kill_r + larvae_kill) * br
             + shed * frac_r;
 
         // --- Биоплёнка: матрикс на открытой поверхности, где бактерии держатся долго.
@@ -285,12 +310,9 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
             + p.s_biofilm * bf
             - p.decay_signal * sig;
         let gfh = sat(g, p.gf_half);
-        let d_gf = p.d_gf * s.gf[i] + p.k_platelet_gf * clot_form + p.gf_m2 * m2 + p.gf_m1 * m1
-            - p.decay_gf * g;
-        let d_vegf = p.d_vegf * s.vegf[i]
-            + p.vegf_hypoxia * hypoxia * (0.1 + m1 + m2 + f)
-            + p.vegf_m2 * m2
-            - p.decay_vegf * a;
+        let d_gf = p.d_gf * s.gf[i] + p.k_platelet_gf * clot_form + p.gf_m2 * m2 + p.gf_m1 * m1 - p.decay_gf * g;
+        let d_vegf =
+            p.d_vegf * s.vegf[i] + p.vegf_hypoxia * hypoxia * (0.1 + m1 + m2 + f) + p.vegf_m2 * m2 - p.decay_vegf * a;
 
         // --- Воспаление. Клетки выходят из сосудов края и дна раны.
         let access = (0.3 * bq + v) * p.perfusion * (1.0 - 0.7 * block);
@@ -309,11 +331,10 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         // в глубоких ранах грануляции растут и со дна.
         let scaffold = (cf + c).clamp(0.05, 1.0) * (1.0 - block);
         let bed_source = if depth > 0.05 { p.bed_fib * bq * gfh * (1.0 - f).max(0.0) * (1.0 - block) } else { 0.0 };
-        let d_fib = p.d_fib * s.fibroblasts[i] * scaffold
-            + p.prolif_fib * f * gfh * oxy * (1.0 - f / p.max_fib)
-            + bed_source
-            - p.fib_return * (f - p.fib_baseline) * c
-            - asp.tox_fib * asc * f;
+        let d_fib =
+            p.d_fib * s.fibroblasts[i] * scaffold + p.prolif_fib * f * gfh * oxy * (1.0 - f / p.max_fib) + bed_source
+                - p.fib_return * (f - p.fib_baseline) * c
+                - asp.tox_fib * asc * f;
         // --- Глубокие слои. Мышца: клетки-сателлиты строят новые волокна, если дефект небольшой,
         // а воспаление утихает; большой дефект, инфекция, некроз и ишемия ведут к фиброзу.
         let lost_mus = p.lost_muscle_mm(dmax);
@@ -353,8 +374,9 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         let islands = if wounded { p.residual_dermis(dmax).powf(p.adnexal_exponent) } else { 0.0 };
         // Во влажной среде (гидрогель) кератиноциты мигрируют быстрее.
         let moist = if gl.hydrogel { 1.3 } else { 1.0 };
-        let d_epi = moist * (p.d_epi * s.epithelium[i]
-            + p.epi_rate * e * (1.0 - e) * (0.5 + 0.5 * gfh) * oxy / (1.0 + bt / p.epi_bact_half))
+        let d_epi = moist
+            * (p.d_epi * s.epithelium[i]
+                + p.epi_rate * e * (1.0 - e) * (0.5 + 0.5 * gfh) * oxy / (1.0 + bt / p.epi_bact_half))
             * epi_scaffold
             + p.adnexal_rate * islands * (1.0 - e) * level * (1.0 - block) * oxy / (1.0 + bt / p.epi_bact_half)
             - asp.tox_epi * asc * e;
@@ -455,13 +477,15 @@ mod tests {
         let mut t = Tissue::healthy(W, H, &p);
         t.injure(WoundShape::Circle { radius: 16.0 }, 5.0, &p);
         run(&mut t, &p, 24 * 10 * 4);
-        let unit = [&t.epithelium, &t.collagen, &t.vessels, &t.bleeding, &t.clot, &t.oxygen, &t.biofilm, &t.myo, &t.fat_new];
+        let unit =
+            [&t.epithelium, &t.collagen, &t.vessels, &t.bleeding, &t.clot, &t.oxygen, &t.biofilm, &t.myo, &t.fat_new];
         for i in 0..t.len() {
             for f in unit {
                 let v = f.data[i];
                 assert!(v.is_finite() && (-1e-6..=1.0 + 1e-6).contains(&v), "значение вне 0..1: {v}");
             }
-            for f in [&t.bacteria, &t.bacteria_res, &t.neutrophils, &t.m1, &t.m2, &t.fibroblasts, &t.signal, &t.debris] {
+            for f in [&t.bacteria, &t.bacteria_res, &t.neutrophils, &t.m1, &t.m2, &t.fibroblasts, &t.signal, &t.debris]
+            {
                 assert!(f.data[i].is_finite() && f.data[i] >= 0.0);
             }
             assert!(t.slough.data[i] <= t.depth.data[i] + 1e-5, "мёртвая ткань не может быть толще полости");

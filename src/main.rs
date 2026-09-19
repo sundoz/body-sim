@@ -91,8 +91,7 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Option<Cli>, Str
             "-h" | "--help" => return Ok(None),
             "--scenario" => {
                 let v = val()?;
-                cli.scenario =
-                    Scenario::parse(&v).ok_or_else(|| format!("неизвестный сценарий: {v}"))?;
+                cli.scenario = Scenario::parse(&v).ok_or_else(|| format!("неизвестный сценарий: {v}"))?;
             }
             "--wound" => {
                 let v = val()?;
@@ -105,37 +104,40 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Option<Cli>, Str
             "--depth" => cli.depth_mm = num(&val()?)?,
             "--antiseptic" => {
                 let v = val()?;
-                cli.antiseptic =
-                    Some(Antiseptic::parse(&v).ok_or_else(|| format!("неизвестный антисептик: {v}"))?);
+                cli.antiseptic = Some(Antiseptic::parse(&v).ok_or_else(|| format!("неизвестный антисептик: {v}"))?);
             }
             "--antiseptic-every" => cli.antiseptic_every = num(&val()?)?,
             "--antibiotic-every" => cli.antibiotics.push((Antibiotic::Cefazolin, num(&val()?)?)),
             "--antibiotics" => {
                 for item in val()?.split(',') {
                     let (name, every) = item.split_once(':').ok_or("формат --antibiotics: cefazolin:8")?;
-                    let drug = Antibiotic::parse(name.trim()).ok_or_else(|| format!("неизвестный антибиотик: {name}"))?;
+                    let drug =
+                        Antibiotic::parse(name.trim()).ok_or_else(|| format!("неизвестный антибиотик: {name}"))?;
                     cli.antibiotics.push((drug, num(every.trim())?));
                 }
             }
             "--debriders" => {
                 for name in val()?.split(',') {
-                    cli.debriders
-                        .push(Debrider::parse(name.trim()).ok_or_else(|| format!("неизвестный метод очищения: {name}"))?);
+                    cli.debriders.push(
+                        Debrider::parse(name.trim()).ok_or_else(|| format!("неизвестный метод очищения: {name}"))?,
+                    );
                 }
             }
-            "--treat-from" => cli.treat_from = val()?.parse().map_err(|_| "--treat-from: ожидалось число")?,
+            "--treat-from" => cli.treat_from = non_negative(&val()?, "--treat-from")?,
             "--debride" => {
-                cli.debride = val()?
-                    .split(',')
-                    .map(|s| s.trim().parse::<f32>().map_err(|_| format!("--debride: плохой день {s}")))
-                    .collect::<Result<_, _>>()?;
+                let mut days: Vec<f32> =
+                    val()?.split(',').map(|s| non_negative(s.trim(), "--debride")).collect::<Result<_, _>>()?;
+                // Обработки выполняются строго по порядку списка, поэтому неотсортированный
+                // список раньше молча терял ранние операции: `3,1` вело себя как `3,3`.
+                days.sort_by(f32::total_cmp);
+                days.dedup();
+                cli.debride = days;
             }
             "--days" => cli.days = num(&val()?)?,
             "--every" => cli.every = num(&val()?)?,
             "--view" => {
                 let v = val()?;
-                cli.view = View::parse(&v)
-                    .ok_or_else(|| format!("неизвестное поле: {v} (есть: {})", View::NAMES))?;
+                cli.view = View::parse(&v).ok_or_else(|| format!("неизвестное поле: {v} (есть: {})", View::NAMES))?;
             }
             "--no-map" => cli.map = false,
             "--csv" => cli.csv = Some(val()?),
@@ -144,6 +146,9 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Option<Cli>, Str
                 let (w, h) = v.split_once('x').ok_or("формат --grid: 96x48")?;
                 cli.w = w.parse().map_err(|_| "формат --grid: 96x48")?;
                 cli.h = h.parse().map_err(|_| "формат --grid: 96x48")?;
+                if cli.w == 0 || cli.h == 0 {
+                    return Err("--grid: размеры сетки должны быть больше нуля".into());
+                }
             }
             _ => return Err(format!("неизвестная опция: {a}")),
         }
@@ -154,8 +159,16 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Option<Cli>, Str
 fn num(s: &str) -> Result<f32, String> {
     s.parse::<f32>()
         .ok()
-        .filter(|v| *v > 0.0)
+        .filter(|v| *v > 0.0 && v.is_finite())
         .ok_or_else(|| format!("ожидалось положительное число, получено: {s}"))
+}
+
+/// Число ≥ 0 (день начала лечения, день обработки: ноль — «сразу»).
+fn non_negative(s: &str, opt: &str) -> Result<f32, String> {
+    s.parse::<f32>()
+        .ok()
+        .filter(|v| *v >= 0.0 && v.is_finite())
+        .ok_or_else(|| format!("{opt}: ожидалось неотрицательное число, получено: {s}"))
 }
 
 /// Момент и величина пика какой-либо популяции.
@@ -188,20 +201,43 @@ fn main() -> ExitCode {
     };
 
     let p = cli.scenario.params();
+    if cli.depth_mm > p.max_depth_mm {
+        eprintln!(
+            "ошибка: --depth {:.1} мм глубже моделируемой колонки ткани ({:.1} мм)",
+            cli.depth_mm, p.max_depth_mm
+        );
+        return ExitCode::FAILURE;
+    }
     let size_cells = cli.size_mm / p.cell_mm;
     let shape = if cli.wound == "cut" {
         WoundShape::Cut { half_length: 2.0 * size_cells, half_width: 1.0 / p.cell_mm }
     } else {
         WoundShape::Circle { radius: size_cells }
     };
+    // Рана наносится в центр участка; вылезая за край, она молча обрезается,
+    // а условие непротекания превращает обрезанный край в «бесконечную» рану.
+    let (need_w, need_h) = match shape {
+        WoundShape::Cut { half_length, half_width } => (2.0 * half_length, 2.0 * half_width),
+        WoundShape::Circle { radius } => (2.0 * radius, 2.0 * radius),
+    };
+    if need_w > cli.w as f32 || need_h > cli.h as f32 {
+        eprintln!(
+            "внимание: рана ({:.0}×{:.0} клеток) не помещается в сетку {}×{} и будет обрезана —              увеличьте --grid или уменьшите --size",
+            need_w, need_h, cli.w, cli.h
+        );
+    }
     let layer = p.layer_title(cli.depth_mm);
     let mut sim = Simulation::new(p, cli.w, cli.h, shape, cli.depth_mm);
 
+    // Ошибки записи CSV не должны теряться: иначе при полном диске файл молча окажется обрезанным.
+    let mut csv_error: Option<std::io::Error> = None;
     let mut csv = match &cli.csv {
         Some(path) => match File::create(path) {
             Ok(f) => {
                 let mut w = BufWriter::new(f);
-                let _ = writeln!(w, "{}", Metrics::CSV_HEADER);
+                if let Err(e) = writeln!(w, "{}", Metrics::CSV_HEADER) {
+                    csv_error = Some(e);
+                }
                 Some(w)
             }
             Err(e) => {
@@ -277,7 +313,9 @@ fn main() -> ExitCode {
 
         let m = sim.latest().clone();
         if let Some(w) = csv.as_mut() {
-            let _ = writeln!(w, "{}", m.csv_row());
+            if let (Err(e), None) = (writeln!(w, "{}", m.csv_row()), &csv_error) {
+                csv_error = Some(e);
+            }
         }
         let phase = m.phase();
         if phase_starts.last().map(|(ph, _)| *ph) != Some(phase) {
@@ -306,7 +344,9 @@ fn main() -> ExitCode {
     }
 
     if let Some(w) = csv.as_mut() {
-        let _ = w.flush();
+        if let (Err(e), None) = (w.flush(), &csv_error) {
+            csv_error = Some(e);
+        }
     }
 
     let last = sim.latest().clone();
@@ -357,6 +397,10 @@ fn main() -> ExitCode {
         last.maturity
     );
     if let Some(path) = &cli.csv {
+        if let Some(e) = &csv_error {
+            eprintln!("ошибка записи CSV {path}: {e}");
+            return ExitCode::FAILURE;
+        }
         println!("  CSV: {path}");
     }
     ExitCode::SUCCESS
@@ -437,9 +481,26 @@ mod tests {
             vec!["--depth", "-1"],
             vec!["--days"],
             vec!["--grid", "40"],
+            vec!["--grid", "0x48"],
+            vec!["--grid", "96x0"],
+            vec!["--treat-from", "-1"],
+            vec!["--debride", "1,-2"],
             vec!["--wat"],
         ] {
             assert!(parse(&bad).is_err(), "{bad:?} должно быть ошибкой");
         }
+    }
+
+    #[test]
+    fn debridement_days_are_sorted_and_deduplicated() {
+        // Обработки выполняются по порядку списка, поэтому «3,1» раньше молча вело себя как «3,3».
+        let cli = parse(&["--debride", "3, 1, 10, 3"]).unwrap().unwrap();
+        assert_eq!(cli.debride, vec![1.0, 3.0, 10.0]);
+        assert_eq!(parse(&["--debride", "0"]).unwrap().unwrap().debride, vec![0.0], "ноль — «сразу»");
+    }
+
+    #[test]
+    fn treatment_may_start_on_day_zero() {
+        assert_eq!(parse(&["--treat-from", "0"]).unwrap().unwrap().treat_from, 0.0);
     }
 }

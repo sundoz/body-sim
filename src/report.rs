@@ -146,6 +146,11 @@ impl Metrics {
     }
 
     pub fn phase(&self) -> Phase {
+        // На нетронутом участке все средние по ране равны нулю (делить не на что),
+        // и «нулевой коллаген» ложно выглядел бы как пролиферация.
+        if self.wound_mm2 <= 0.0 {
+            return Phase::Remodeling;
+        }
         if self.bleeding > 0.05 {
             Phase::Hemostasis
         } else if self.neutrophils + self.m1 > self.m2 + self.fibroblasts {
@@ -424,11 +429,7 @@ pub fn render_map(t: &Tissue, view: View) -> String {
         out.push('|');
         for x in 0..t.w {
             let i0 = y * t.w + x;
-            let v = if y + 1 < t.h {
-                0.5 * (view.value(t, i0) + view.value(t, i0 + t.w))
-            } else {
-                view.value(t, i0)
-            };
+            let v = if y + 1 < t.h { 0.5 * (view.value(t, i0) + view.value(t, i0 + t.w)) } else { view.value(t, i0) };
             let k = (v.clamp(0.0, 1.0) * (RAMP.len() - 1) as f32).round() as usize;
             out.push(RAMP[k] as char);
         }
@@ -476,7 +477,8 @@ pub fn print_snapshot(m: &Metrics, map: Option<&str>) {
         m.epithelium, m.collagen, m.maturity, m.strength, m.integrity
     );
     if m.lost_fat_mm > 0.0 {
-        let mut line = format!("  клетчатка: утрачено {:.1} мм, вернулось жиром {:.0}%", m.lost_fat_mm, m.fat_regen * 100.0);
+        let mut line =
+            format!("  клетчатка: утрачено {:.1} мм, вернулось жиром {:.0}%", m.lost_fat_mm, m.fat_regen * 100.0);
         if m.lost_muscle_mm > 0.0 {
             line += &format!(
                 " | мышца: утрачено {:.1} мм, новые волокна {:.0}%, фиброз {:.0}%",
@@ -528,7 +530,8 @@ mod tests {
 
     #[test]
     fn condition_classification() {
-        let base = Metrics { wound_mm2: 50.0, initial_wound_mm2: 50.0, open_fraction: 0.8, hours: 24.0, ..Default::default() };
+        let base =
+            Metrics { wound_mm2: 50.0, initial_wound_mm2: 50.0, open_fraction: 0.8, hours: 24.0, ..Default::default() };
         let with = |f: &dyn Fn(&mut Metrics)| {
             let mut m = base.clone();
             f(&mut m);
@@ -537,7 +540,11 @@ mod tests {
         assert_eq!(with(&|_| {}), Condition::Healing);
         assert_eq!(with(&|m| m.infected_mm2 = 200.0), Condition::Sepsis);
         assert_eq!(with(&|m| m.infected_mm2 = 80.0), Condition::Spreading);
-        assert_eq!(with(&|m| m.infected_mm2 = 50.0), Condition::Healing, "инфекция в пределах раны — не распространение");
+        assert_eq!(
+            with(&|m| m.infected_mm2 = 50.0),
+            Condition::Healing,
+            "инфекция в пределах раны — не распространение"
+        );
         assert_eq!(with(&|m| m.necrotic_mm2 = 20.0), Condition::Necrosis);
         assert_eq!(
             with(&|m| {
@@ -562,9 +569,18 @@ mod tests {
     }
 
     #[test]
+    fn intact_skin_is_not_in_the_proliferation_phase() {
+        let p = Params::default();
+        let t = Tissue::healthy(96, 48, &p);
+        let m = Metrics::measure(&t, &p, 0.0);
+        assert_eq!(m.wound_mm2, 0.0);
+        assert_eq!(m.phase(), Phase::Remodeling, "раны нет — заживать нечему");
+    }
+
+    #[test]
     fn phases() {
         let m = |f: &dyn Fn(&mut Metrics)| {
-            let mut m = Metrics { open_fraction: 0.5, collagen: 0.2, ..Default::default() };
+            let mut m = Metrics { wound_mm2: 50.0, open_fraction: 0.5, collagen: 0.2, ..Default::default() };
             f(&mut m);
             m.phase()
         };

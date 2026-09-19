@@ -122,6 +122,10 @@ impl Tissue {
         self.w * self.h
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Наносит повреждение глубиной `depth_mm` в центре участка.
     pub fn injure(&mut self, shape: WoundShape, depth_mm: f32, p: &Params) {
         let cx = (self.w as f32 - 1.0) / 2.0;
@@ -134,8 +138,10 @@ impl Tissue {
                 let inside = match shape {
                     WoundShape::Circle { radius } => radius - (dx * dx + dy * dy).sqrt(),
                     WoundShape::Cut { half_length, half_width } => {
-                        let d = ((dx / half_length).powi(2) + (dy / half_width).powi(2)).sqrt();
-                        (1.0 - d) * half_width.min(half_length)
+                        // Вырожденный разрез (нулевая полуось) иначе даёт деление на ноль и NaN.
+                        let (hl, hw) = (half_length.max(1e-3), half_width.max(1e-3));
+                        let d = ((dx / hl).powi(2) + (dy / hw).powi(2)).sqrt();
+                        (1.0 - d) * hw.min(hl)
                     }
                 };
                 self.damage_cell(y * self.w + x, inside + 0.5, depth_mm, p);
@@ -166,7 +172,15 @@ impl Tissue {
     /// Повреждает клетку на долю `amount` (0..1): клетки на краю раны
     /// повреждены частично, поэтому граница не ступенчатая.
     /// В неглубоких ранах часть дермы (с сосудами, фибробластами и фолликулами) уцелевает.
+    ///
+    /// Глубина обрезается по `max_depth_mm`: шаг модели всё равно держит полость в этих
+    /// пределах, а незажатая `depth_max` потом даёт нефизичные «утрачено N мм мышцы».
+    /// Нефинитная доля (вырожденная форма раны) игнорируется, иначе NaN расползётся по полям.
     fn damage_cell(&mut self, i: usize, amount: f32, depth_mm: f32, p: &Params) {
+        if !amount.is_finite() || !depth_mm.is_finite() {
+            return;
+        }
+        let depth_mm = depth_mm.min(p.max_depth_mm);
         let a = amount.clamp(0.0, 1.0);
         if a <= 0.0 {
             return;
@@ -294,6 +308,29 @@ mod tests {
         let lost_after = p.lost_muscle_mm(12.0);
         assert!((t.myo.data[c] - 0.8 * lost_before / lost_after).abs() < 1e-5);
         assert!((t.fat_new.data[c] - 0.5).abs() < 1e-5, "вся клетчатка уже была утрачена");
+    }
+
+    #[test]
+    fn injury_deeper_than_the_block_is_clamped() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(W, H, &p);
+        t.injure(WoundShape::Circle { radius: 10.0 }, 50.0, &p);
+        let c = center();
+        assert!((t.depth.data[c] - p.max_depth_mm).abs() < 1e-5);
+        assert!((t.depth_max.data[c] - p.max_depth_mm).abs() < 1e-5);
+        // Иначе метрики отрапортовали бы утрату мышцы толще самой колонки ткани.
+        assert!(p.lost_muscle_mm(t.depth_max.data[c]) < p.max_depth_mm);
+    }
+
+    #[test]
+    fn degenerate_wound_shapes_do_not_poison_the_fields() {
+        let p = Params::default();
+        let mut t = Tissue::healthy(W, H, &p);
+        t.injure(WoundShape::Cut { half_length: 0.0, half_width: 0.0 }, 2.5, &p);
+        t.injure_disk(10.0, 10.0, 3.0, f32::NAN, &p);
+        for f in [&t.depth, &t.collagen, &t.epithelium, &t.vessels, &t.clot, &t.fibroblasts] {
+            assert!(f.data.iter().all(|v| v.is_finite()), "NaN расползся по полям");
+        }
     }
 
     #[test]

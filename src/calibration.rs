@@ -50,11 +50,11 @@ pub struct Knob {
 
 impl Knob {
     /// Значение ↔ координата 0..1 (логарифмическая шкала между границами).
-    fn to_unit(&self, v: f32) -> f32 {
+    fn unit_of(self, v: f32) -> f32 {
         ((v / self.lo).ln() / (self.hi / self.lo).ln()).clamp(0.0, 1.0)
     }
 
-    fn from_unit(&self, u: f32) -> f32 {
+    fn value_of(self, u: f32) -> f32 {
         self.lo * (self.hi / self.lo).powf(u.clamp(0.0, 1.0))
     }
 }
@@ -132,15 +132,21 @@ fn observe_cells(p: &Params) -> Vec<Obs> {
     let s = run(p, 2.5, 16.0, false);
     let neut_peak = s.history.iter().map(|m| m.neutrophils).fold(0.0, f32::max).max(1e-6);
     vec![
-        Obs { name: "пик нейтрофилов, день", target: 1.0, tol: 0.5, value: peak_day(&s, |m| m.neutrophils) },
-        Obs { name: "пик макрофагов, день", target: 2.5, tol: 0.75, value: peak_day(&s, |m| m.m1 + m.m2) },
+        Obs {
+            name: "пик нейтрофилов, день", target: 1.0, tol: 0.5, value: peak_day(&s, |m| m.neutrophils)
+        },
+        Obs {
+            name: "пик макрофагов, день", target: 2.5, tol: 0.75, value: peak_day(&s, |m| m.m1 + m.m2)
+        },
         Obs {
             name: "нейтрофилы на 7-й день / пик",
             target: 0.1,
             tol: 0.1,
             value: at_day(&s, 7.0).neutrophils / neut_peak,
         },
-        Obs { name: "пик фибробластов, день", target: 10.0, tol: 3.0, value: peak_day(&s, |m| m.fibroblasts) },
+        Obs {
+            name: "пик фибробластов, день", target: 10.0, tol: 3.0, value: peak_day(&s, |m| m.fibroblasts)
+        },
     ]
 }
 
@@ -152,7 +158,9 @@ fn closure_day(p: &Params, depth_mm: f32, limit: f32) -> f32 {
 
 fn observe_closure(p: &Params) -> Vec<Obs> {
     vec![
-        Obs { name: "эпителизация ссадины 0.1 мм, день", target: 8.0, tol: 3.0, value: closure_day(p, 0.1, 25.0) },
+        Obs {
+            name: "эпителизация ссадины 0.1 мм, день", target: 8.0, tol: 3.0, value: closure_day(p, 0.1, 25.0)
+        },
         Obs {
             name: "эпителизация донорского места 0.3 мм, день",
             target: 12.0,
@@ -178,9 +186,13 @@ fn observe_strength(p: &Params) -> Vec<Obs> {
     let s = run(p, 2.5, 90.0, false);
     vec![
         Obs { name: "прочность на 7-й день", target: 0.03, tol: 0.05, value: at_day(&s, 7.0).strength },
-        Obs { name: "прочность на 21-й день", target: 0.2, tol: 0.07, value: at_day(&s, 21.0).strength },
+        Obs {
+            name: "прочность на 21-й день", target: 0.2, tol: 0.07, value: at_day(&s, 21.0).strength
+        },
         Obs { name: "прочность на 42-й день", target: 0.4, tol: 0.1, value: at_day(&s, 42.0).strength },
-        Obs { name: "прочность на 90-й день", target: 0.62, tol: 0.08, value: at_day(&s, 90.0).strength },
+        Obs {
+            name: "прочность на 90-й день", target: 0.62, tol: 0.08, value: at_day(&s, 90.0).strength
+        },
     ]
 }
 
@@ -195,6 +207,7 @@ pub fn nelder_mead(
     mut on_iter: impl FnMut(usize, f32),
 ) -> (Vec<f32>, f32) {
     let n = x0.len();
+    assert!(n > 0, "Нелдеру–Миду нужен хотя бы один параметр");
     let mut simplex: Vec<(Vec<f32>, f32)> = Vec::with_capacity(n + 1);
     simplex.push((x0.to_vec(), f(x0)));
     for i in 0..n {
@@ -209,8 +222,10 @@ pub fn nelder_mead(
         if (simplex[n].1 - simplex[0].1).abs() <= tol * (1.0 + simplex[0].1.abs()) {
             break;
         }
-        let centroid: Vec<f32> = (0..n).map(|j| simplex[..n].iter().map(|(x, _)| x[j]).sum::<f32>() / n as f32).collect();
-        let along = |t: f32| -> Vec<f32> { (0..n).map(|j| centroid[j] + t * (simplex[n].0[j] - centroid[j])).collect() };
+        let centroid: Vec<f32> =
+            (0..n).map(|j| simplex[..n].iter().map(|(x, _)| x[j]).sum::<f32>() / n as f32).collect();
+        let along =
+            |t: f32| -> Vec<f32> { (0..n).map(|j| centroid[j] + t * (simplex[n].0[j] - centroid[j])).collect() };
         let xr = along(-1.0);
         let fr = f(&xr);
         if fr < simplex[0].1 {
@@ -234,10 +249,10 @@ pub fn nelder_mead(
             } else {
                 // Сжатие всего симплекса к лучшей точке.
                 let best = simplex[0].0.clone();
-                for k in 1..=n {
-                    let x: Vec<f32> = (0..n).map(|j| best[j] + 0.5 * (simplex[k].0[j] - best[j])).collect();
+                for point in simplex.iter_mut().skip(1) {
+                    let x: Vec<f32> = (0..n).map(|j| best[j] + 0.5 * (point.0[j] - best[j])).collect();
                     let fx = f(&x);
-                    simplex[k] = (x, fx);
+                    *point = (x, fx);
                 }
             }
         }
@@ -257,11 +272,11 @@ pub struct StageResult {
 pub fn calibrate(stage: &Stage, p: &mut Params, max_iter: usize, mut progress: impl FnMut(usize, f32)) -> StageResult {
     let before = (stage.observe)(p);
     let old: Vec<f32> = stage.knobs.iter().map(|k| (k.get)(p)).collect();
-    let x0: Vec<f32> = stage.knobs.iter().map(|k| k.to_unit((k.get)(p))).collect();
+    let x0: Vec<f32> = stage.knobs.iter().map(|k| k.unit_of((k.get)(p))).collect();
     let base = p.clone();
     let apply = |x: &[f32], p: &mut Params| {
         for (k, &u) in stage.knobs.iter().zip(x) {
-            (k.set)(p, k.from_unit(u));
+            (k.set)(p, k.value_of(u));
         }
     };
     let (best, _) = nelder_mead(
@@ -288,14 +303,8 @@ mod tests {
 
     #[test]
     fn nelder_mead_finds_minimum_of_a_bowl() {
-        let (x, fx) = nelder_mead(
-            |x| (x[0] - 0.3).powi(2) + 2.0 * (x[1] - 0.7).powi(2),
-            &[0.5, 0.5],
-            0.1,
-            500,
-            1e-9,
-            |_, _| {},
-        );
+        let (x, fx) =
+            nelder_mead(|x| (x[0] - 0.3).powi(2) + 2.0 * (x[1] - 0.7).powi(2), &[0.5, 0.5], 0.1, 500, 1e-9, |_, _| {});
         assert!(fx < 1e-6, "{fx}");
         assert!((x[0] - 0.3).abs() < 1e-2 && (x[1] - 0.7).abs() < 1e-2, "{x:?}");
     }
@@ -327,9 +336,9 @@ mod tests {
     fn knob_log_mapping_round_trips() {
         let k = knob!(epi_rate, 0.01, 1.0);
         for v in [0.01, 0.05, 0.1, 0.5, 1.0] {
-            assert!((k.from_unit(k.to_unit(v)) - v).abs() / v < 1e-4);
+            assert!((k.value_of(k.unit_of(v)) - v).abs() / v < 1e-4);
         }
-        assert!((k.from_unit(0.5) - 0.1).abs() < 1e-5, "середина — среднее геометрическое");
+        assert!((k.value_of(0.5) - 0.1).abs() < 1e-5, "середина — среднее геометрическое");
         let mut p = Params::default();
         (k.set)(&mut p, 0.2);
         assert_eq!((k.get)(&p), 0.2);

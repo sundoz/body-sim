@@ -32,6 +32,8 @@ const DEPTHS: [(f32, &str, &str); 5] = [
     (5.0, "5", "до клетчатки: дно раны плохо кровоснабжается"),
     (9.0, "9", "до мышцы: долгое заполнение глубокой полости"),
 ];
+/// Глубина колонки ткани (`Params::max_depth_mm`) — предел для отладочного `--depth`.
+const MAX_DEPTH_MM: f32 = 12.0;
 const DRESSINGS: [(Option<f32>, &str); 3] = [(None, "нет"), (Some(12.0), "12 ч"), (Some(24.0), "24 ч")];
 const ABX: [(Option<f32>, &str); 4] = [(None, "нет"), (Some(8.0), "8 ч"), (Some(12.0), "12 ч"), (Some(24.0), "24 ч")];
 
@@ -276,7 +278,11 @@ fn draw_tissue_3d(ui: &Ui, app: &mut App, scene: &mut Scene3D, prof: &mut prof::
     prof.add("сцена: вид клеток", scene.timings[0]);
     prof.add("сцена: меши", scene.timings[1]);
     prof.add("сцена: текстуры срезов", scene.timings[2]);
-    let pick = if app.orbiting { None } else { prof.time("выбор точки лучом", || scene.pick(r, ui.mouse(), gy_limit(app))) };
+    let pick = if app.orbiting {
+        None
+    } else {
+        prof.time("выбор точки лучом", || scene.pick(r, ui.mouse(), gy_limit(app)))
+    };
     if let Some(p) = &pick {
         if ui.mouse_down() {
             let rad = app.brush_mm / app.sim.p.cell_mm;
@@ -300,11 +306,7 @@ fn draw_tissue_3d(ui: &Ui, app: &mut App, scene: &mut Scene3D, prof: &mut prof::
             let right = scene.project(r, scene.front_edge_point(true, gy, depth));
             let (Some(a), Some(b)) = (left, right) else { continue };
             let w = ui.measure(name, 13, false);
-            let (anchor, tx) = if a.x - 40.0 - w > r.x + 6.0 {
-                (a, a.x - 40.0 - w)
-            } else {
-                (b, b.x + 40.0)
-            };
+            let (anchor, tx) = if a.x - 40.0 - w > r.x + 6.0 { (a, a.x - 40.0 - w) } else { (b, b.x + 40.0) };
             if tx < r.x || tx + w > r.x + r.w || anchor.y < r.y || anchor.y > r.y + r.h {
                 continue;
             }
@@ -323,7 +325,10 @@ fn draw_tissue_3d(ui: &Ui, app: &mut App, scene: &mut Scene3D, prof: &mut prof::
     draw_rectangle(r.x, r.y, r.w, 30.0, Color::new(0.0, 0.0, 0.0, 0.35));
     shadow_text(
         ui,
-        &format!("ЛКМ — рана · ПКМ — вращать · колесо — масштаб · Shift+колесо — кисть {:.1} мм · {cut_note}", app.brush_mm),
+        &format!(
+            "ЛКМ — рана · ПКМ — вращать · колесо — масштаб · Shift+колесо — кисть {:.1} мм · {cut_note}",
+            app.brush_mm
+        ),
         r.x + 12.0,
         r.y + 20.0,
         12,
@@ -456,12 +461,21 @@ fn draw_tooltip(ui: &Ui, app: &App, i: usize) {
 
 // ---------------------------------------------------------------- панель
 
-fn metric_row(ui: &Ui, x: f32, y: f32, w: f32, name: &str, value: &str, frac: f32, color: Color) {
-    ui.text(name, x, y + 12.0, 13, ui::TEXT);
-    ui.text_right(value, x + w, y + 12.0, 13, ui::MUTED);
+/// Строка сводки: подпись, значение справа и полоска заполнения под ними.
+struct MetricRow<'a> {
+    name: &'a str,
+    value: &'a str,
+    /// Насколько заполнена полоска, 0..1.
+    frac: f32,
+    color: Color,
+}
+
+fn metric_row(ui: &Ui, x: f32, y: f32, w: f32, row: &MetricRow) {
+    ui.text(row.name, x, y + 12.0, 13, ui::TEXT);
+    ui.text_right(row.value, x + w, y + 12.0, 13, ui::MUTED);
     ui::fill_rounded(Rect::new(x, y + 17.0, w, 3.0), 1.5, ui::BTN);
-    if frac > 0.002 {
-        ui::fill_rounded(Rect::new(x, y + 17.0, w * frac.clamp(0.0, 1.0), 3.0), 1.5, color);
+    if row.frac > 0.002 {
+        ui::fill_rounded(Rect::new(x, y + 17.0, w * row.frac.clamp(0.0, 1.0), 3.0), 1.5, row.color);
     }
 }
 
@@ -497,7 +511,8 @@ fn draw_patient_tab(ui: &Ui, app: &mut App, x: f32, mut y: f32, iw: f32) {
 
     ui.section("РАНА", x, y);
     y += 20.0;
-    if let Some(s) = button_row(ui, x, y, iw, &[(Shape::Circle, "Круглая"), (Shape::Cut, "Разрез")], app.shape) {
+    if let Some(s) = button_row(ui, x, y, iw, &[(Shape::Circle, "Круглая"), (Shape::Cut, "Разрез")], app.shape)
+    {
         app.shape = s;
         app.reset();
     }
@@ -617,7 +632,12 @@ fn draw_metrics(ui: &Ui, m: &Metrics, x: f32, mut y: f32, iw: f32) {
     y += 22.0;
     let c = |i: usize| chart::COLORS[i];
     let muscle = if m.lost_muscle_mm > 0.0 {
-        format!("−{:.1} мм: волокна {:.0}% · фиброз {:.0}%", m.lost_muscle_mm, m.muscle_regen * 100.0, m.muscle_fibrosis * 100.0)
+        format!(
+            "−{:.1} мм: волокна {:.0}% · фиброз {:.0}%",
+            m.lost_muscle_mm,
+            m.muscle_regen * 100.0,
+            m.muscle_fibrosis * 100.0
+        )
     } else {
         "не задета".to_string()
     };
@@ -630,19 +650,9 @@ fn draw_metrics(ui: &Ui, m: &Metrics, x: f32, mut y: f32, iw: f32) {
         ("Открытая площадь", format!("{:.1} из {:.1} мм²", m.open_mm2, m.wound_mm2), m.open_fraction, c(0)),
         ("Глубина полости", format!("{:.1} мм (макс. {:.1})", m.depth, m.depth_max), m.depth / 5.0, c(1)),
         ("Некроз", format!("{:.1} мм²", m.necrotic_mm2), m.necrotic_mm2 / m.wound_mm2.max(1.0), c(2)),
-        (
-            "Бактерии",
-            format!("{:.2} · устойч. {:.0}%", m.bacteria, m.resistant_fraction * 100.0),
-            m.bacteria,
-            c(3),
-        ),
+        ("Бактерии", format!("{:.2} · устойч. {:.0}%", m.bacteria, m.resistant_fraction * 100.0), m.bacteria, c(3)),
         ("Биоплёнка", format!("{:.2}", m.biofilm), m.biofilm, c(5)),
-        (
-            "Нейтрофилы · M1 · M2",
-            format!("{:.2} · {:.2} · {:.2}", m.neutrophils, m.m1, m.m2),
-            m.neutrophils,
-            c(6),
-        ),
+        ("Нейтрофилы · M1 · M2", format!("{:.2} · {:.2} · {:.2}", m.neutrophils, m.m1, m.m2), m.neutrophils, c(6)),
         ("Фибробласты", format!("{:.2}", m.fibroblasts), m.fibroblasts, c(9)),
         ("Сосуды · кислород", format!("{:.2} · {:.2}", m.vessels, m.oxygen), m.vessels, c(10)),
         ("Коллаген", format!("{:.2}", m.collagen), m.collagen, c(11)),
@@ -651,7 +661,7 @@ fn draw_metrics(ui: &Ui, m: &Metrics, x: f32, mut y: f32, iw: f32) {
         ("Прочность рубца", format!("{:.0}%", m.strength * 100.0), m.strength, c(12)),
     ];
     for (name, val, frac, color) in rows.iter() {
-        metric_row(ui, x, y, iw, name, val, *frac, *color);
+        metric_row(ui, x, y, iw, &MetricRow { name, value: val, frac: *frac, color: *color });
         y += 24.0;
     }
 }
@@ -740,7 +750,8 @@ fn parse_opts() -> Opts {
                 let v = args.next().unwrap_or_default();
                 match a.as_str() {
                     "--scenario" => o.scenario = Scenario::parse(&v).unwrap_or(Scenario::Healthy),
-                    "--depth" => o.depth = v.parse().unwrap_or(2.5),
+                    // Глубже колонки ткани нельзя: модель всё равно обрежет полость по max_depth_mm.
+                    "--depth" => o.depth = v.parse().map_or(2.5, |d: f32| d.clamp(0.0, MAX_DEPTH_MM)),
                     "--view" => o.view = View::parse(&v),
                     "--cam" => {
                         let n: Vec<f32> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();

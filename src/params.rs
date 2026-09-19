@@ -304,6 +304,9 @@ impl Default for Params {
     }
 }
 
+/// Кусочно-линейная интерполяция по узлам, отсортированным по x.
+/// Вырожденный отрезок (x1 <= x0) — ступенька, а не деление на ноль:
+/// узлы зависят от толщин слоёв, и при тонкой клетчатке они могут сойтись.
 fn lerp_points(x: f32, pts: &[(f32, f32)]) -> f32 {
     if x <= pts[0].0 {
         return pts[0].1;
@@ -311,6 +314,9 @@ fn lerp_points(x: f32, pts: &[(f32, f32)]) -> f32 {
     for w in pts.windows(2) {
         let ((x0, y0), (x1, y1)) = (w[0], w[1]);
         if x <= x1 {
+            if x1 <= x0 {
+                return y1;
+            }
             return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
         }
     }
@@ -332,7 +338,12 @@ impl Params {
         let (s, f) = (self.skin_bottom_mm(), self.fat_bottom_mm());
         lerp_points(
             depth_mm,
-            &[(s, 1.0), (s + 0.5, self.fat_bed_perfusion), (f, self.fat_bed_perfusion), (f + 0.5, self.muscle_bed_perfusion)],
+            &[
+                (s, 1.0),
+                (s + 0.5, self.fat_bed_perfusion),
+                (f, self.fat_bed_perfusion),
+                (f + 0.5, self.muscle_bed_perfusion),
+            ],
         )
     }
 
@@ -507,6 +518,16 @@ mod tests {
         assert!(close(p.bed_perfusion(11.0), p.muscle_bed_perfusion), "мышца — снова хорошо");
         assert!(p.bed_perfusion(5.0) < p.bed_perfusion(1.0));
         assert!(p.bed_perfusion(11.0) > p.bed_perfusion(5.0));
+    }
+
+    #[test]
+    fn bed_perfusion_survives_a_thin_fat_layer() {
+        // Узлы (s + 0.5) и (f) сходятся и меняются местами — интерполяция не должна давать NaN.
+        let p = Params { fat_mm: 0.2, ..Params::default() };
+        for d in [0.0, 1.0, 2.2, 2.4, 3.0, 9.0] {
+            let v = p.bed_perfusion(d);
+            assert!(v.is_finite() && (0.0..=1.0).contains(&v), "перфузия дна {v} на {d} мм");
+        }
     }
 
     #[test]
