@@ -7,6 +7,11 @@
 pub struct Params {
     pub dt: f32,
     pub cell_mm: f32,
+    /// Место на теле: задаёт анатомию колонки и площадь области.
+    pub site: crate::body::BodySite,
+    /// Какая доля этой области тела поражена, % — моделируемый участок считается
+    /// её представительным куском. None — поражение равно моделируемому участку.
+    pub lesion_percent: Option<f32>,
 
     // Анатомия колонки ткани (мм) и кровоснабжение
     pub epidermis_mm: f32,
@@ -14,8 +19,14 @@ pub struct Params {
     pub fat_mm: f32,
     /// Системная перфузия конечности: 1 — норма, <0.5 — ишемия.
     pub perfusion: f32,
+    /// Множитель местного кровоснабжения от места на теле (см. `BodySite`).
+    /// Отдельно от `perfusion`, потому что сценарий задаёт системную перфузию
+    /// абсолютным значением и иначе затёр бы вклад анатомии.
+    pub site_perfusion: f32,
     pub fat_bed_perfusion: f32,
     pub muscle_bed_perfusion: f32,
+    /// Толщина слоя мышцы под фасцией, которую моделируем (мм).
+    pub muscle_mm: f32,
 
     // Гемостаз
     pub k_clot: f32,
@@ -172,15 +183,19 @@ pub struct Params {
 impl Default for Params {
     fn default() -> Self {
         Self {
-            dt: 0.1,
-            cell_mm: 0.25,
+            dt: CALIBRATION_DT,
+            cell_mm: CALIBRATION_CELL_MM,
+            site: crate::body::BodySite::Forearm,
+            lesion_percent: None,
 
             epidermis_mm: 0.1,
             dermis_mm: 2.0,
             fat_mm: 6.0,
             perfusion: 1.0,
+            site_perfusion: 1.0,
             fat_bed_perfusion: 0.6,
             muscle_bed_perfusion: 0.9,
+            muscle_mm: 3.9,
 
             k_clot: 2.0,
             k_stop: 3.0,
@@ -323,7 +338,64 @@ fn lerp_points(x: f32, pts: &[(f32, f32)]) -> f32 {
     pts[pts.len() - 1].1
 }
 
+/// Разрешение сетки, при котором откалиброваны коэффициенты диффузии.
+pub const CALIBRATION_CELL_MM: f32 = 0.25;
+
+/// Шаг по времени, при котором калибровалась модель: мельче делаем только ради устойчивости.
+pub const CALIBRATION_DT: f32 = 0.1;
+
+/// Жёсткий предел устойчивости явной схемы с 5-точечным лапласианом.
+/// Собственные числа шаблона лежат в [-8, 0], коэффициент усиления g = 1 - 8·D·dt,
+/// поэтому |g| ≤ 1 требует D·dt ≤ 0.25.
+pub const DIFFUSION_STABILITY_LIMIT: f32 = 0.25;
+
+/// Рабочий запас, в который целится `fit_dt`. Ровно на пределе g = -1: шахматный мод
+/// не расходится, но и не затухает, и поле начинает звенеть от клетки к клетке —
+/// кислород проваливается ниже критического локально, и появляется ложный некроз.
+/// При 0.2 тот же мод гасится в 0.6 раза за шаг.
+const DIFFUSION_TARGET: f32 = 0.2;
+
 impl Params {
+    /// Итоговое кровоснабжение: системное (болезнь) × местное (анатомия).
+    pub fn blood_supply(&self) -> f32 {
+        self.perfusion * self.site_perfusion
+    }
+
+    /// Коэффициенты диффузии заданы в клетках²/ч при `CALIBRATION_CELL_MM`.
+    /// На сетке с другим шагом их надо пересчитать: D_клеток = D_мм²/ч / cell_mm².
+    /// При опорном разрешении возвращает ровно 1.0, поэтому пересчёт не трогает
+    /// ни одного бита в уже откалиброванных прогонах.
+    pub fn diffusion_scale(&self) -> f32 {
+        (CALIBRATION_CELL_MM / self.cell_mm).powi(2)
+    }
+
+    /// Наибольший коэффициент диффузии на текущей сетке, клеток²/ч.
+    pub fn max_diffusion(&self) -> f32 {
+        let d = [
+            self.d_signal,
+            self.d_gf,
+            self.d_vegf,
+            self.d_o2,
+            self.d_bact,
+            self.d_neut,
+            self.d_mac,
+            self.d_fib,
+            self.d_vessel,
+            self.d_epi,
+            self.d_toxin,
+        ];
+        d.iter().fold(0.0f32, |a, b| a.max(*b)) * self.diffusion_scale()
+    }
+
+    /// Подобрать шаг по времени под разрешение сетки: на мелкой сетке коэффициенты
+    /// диффузии растут как 1/cell_mm², и прежний dt перестаёт быть устойчивым.
+    /// Шаг всегда вида 1/n часа, иначе история метрик перестанет попадать на целые часы.
+    pub fn fit_dt(&mut self) {
+        let limit = DIFFUSION_TARGET / self.max_diffusion().max(1e-6);
+        let per_hour = (1.0 / limit).ceil().max(1.0 / CALIBRATION_DT) as usize;
+        self.dt = 1.0 / per_hour as f32;
+    }
+
     pub fn skin_bottom_mm(&self) -> f32 {
         self.epidermis_mm + self.dermis_mm
     }
@@ -438,13 +510,22 @@ impl Scenario {
         }
     }
 
+    /// Параметры для опорной анатомии (предплечье).
     pub fn params(self) -> Params {
-        let mut p = Params::default();
+        self.params_at(crate::body::BodySite::Forearm)
+    }
+
+    /// Параметры для конкретного места на теле.
+    /// Порядок важен: сначала место задаёт ткань (толщину слоёв, местный кровоток,
+    /// плотность придатков, флору), затем сценарий — болезнь пациента поверх неё.
+    pub fn params_at(self, site: crate::body::BodySite) -> Params {
+        let mut p = Params { site, ..Params::default() };
+        site.apply(&mut p);
         match self {
             Self::Healthy => {}
             Self::Diabetic => diabetic(&mut p),
             Self::Infected => {
-                p.initial_bacteria = 0.5;
+                p.initial_bacteria = p.initial_bacteria.max(0.5);
                 p.bact_growth = 0.35;
             }
             Self::Elderly => {
@@ -462,12 +543,12 @@ impl Scenario {
             Self::DiabeticFoot => {
                 diabetic(&mut p);
                 p.perfusion = 0.45;
-                p.initial_bacteria = 0.3;
+                p.initial_bacteria = p.initial_bacteria.max(0.3);
                 p.bact_growth = 0.3;
             }
             Self::Necrotizing => {
                 // Высоковирулентный токсинпродуцирующий штамм, растёт в живой ткани.
-                p.initial_bacteria = 0.3;
+                p.initial_bacteria = p.initial_bacteria.max(0.3);
                 p.bact_growth = 0.4;
                 p.bact_invasion = 0.35;
                 p.d_bact = 0.1;
@@ -581,8 +662,26 @@ mod tests {
         // Явная схема устойчива при D·dt ≤ 0.25 (5-точечный лапласиан).
         let p = Params::default();
         for d in [p.d_signal, p.d_gf, p.d_vegf, p.d_o2, p.d_bact, p.d_neut, p.d_mac, p.d_fib, p.d_vessel, p.d_epi] {
-            assert!(d * p.dt <= 0.25, "D = {d}");
+            assert!(d * p.dt <= DIFFUSION_STABILITY_LIMIT, "D = {d}");
         }
-        assert!(Scenario::Necrotizing.params().d_bact * p.dt <= 0.25);
+        assert!(Scenario::Necrotizing.params().d_bact * p.dt <= DIFFUSION_STABILITY_LIMIT);
+    }
+
+    #[test]
+    fn fit_dt_keeps_a_margin_below_the_stability_limit() {
+        // На опорной сетке шаг не меняется — калибровка не должна поехать.
+        let mut p = Params::default();
+        p.fit_dt();
+        assert_eq!(p.dt, CALIBRATION_DT);
+        // На мелкой сетке коэффициенты растут как 1/cell_mm², и шаг обязан уменьшиться,
+        // причём с запасом: ровно на пределе шахматный мод не затухает и поле звенит.
+        for cell in [0.2, 0.125, 0.1, 0.05] {
+            let mut p = Params { cell_mm: cell, ..Params::default() };
+            p.fit_dt();
+            let per_hour = 1.0 / p.dt;
+            assert!((per_hour - per_hour.round()).abs() < 1e-4, "шаг {} не делит час нацело", p.dt);
+            assert!(p.max_diffusion() * p.dt < DIFFUSION_STABILITY_LIMIT, "cell {cell}: нет запаса");
+            assert!(p.dt <= CALIBRATION_DT, "мелкая сетка не может позволить более крупный шаг");
+        }
     }
 }

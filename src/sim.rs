@@ -144,7 +144,17 @@ pub fn step(t: &mut Tissue, p: &Params, s: &mut Scratch) {
         (&t.epithelium, &mut s.epithelium),
         (&t.toxin, &mut s.toxin),
     ];
-    lap.into_par_iter().for_each(|(field, out)| field.laplacian_into(out));
+    // Коэффициенты диффузии откалиброваны в клетках²/ч при cell_mm = 0.25. На сетке
+    // с другим шагом их нужно пересчитать; масштаб применяем здесь, к лапласианам, —
+    // так его нельзя забыть ни для одного поля. При опорном разрешении множитель
+    // ровно 1.0, и цикл пропускается, поэтому прежние прогоны не меняются ни на бит.
+    let ds = p.diffusion_scale();
+    lap.into_par_iter().for_each(|(field, out)| {
+        field.laplacian_into(out);
+        if ds != 1.0 {
+            out.iter_mut().for_each(|v| *v *= ds);
+        }
+    });
 
     let gl = Globals {
         asp: t.antiseptic_agent.props(),
@@ -170,6 +180,8 @@ fn rescale(frac: f32, lost_old: f32, lost_new: f32) -> f32 {
 fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
     let dt = p.dt;
     let asp = &gl.asp;
+    // Системная перфузия (болезнь) вместе с местной (анатомия места на теле).
+    let perfusion = p.blood_supply();
     for j in 0..ch.len {
         let i = ch.base + j;
         let bl = ch.bleeding[j];
@@ -214,8 +226,8 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         // --- Кислород: подаётся сосудами и дном раны, тратится клетками и бактериями.
         let load = 0.1 + n + m1 + m2 + f + 0.5 * bt;
         // Воспаление расширяет сосуды (гиперемия) — но только если артерии на это способны.
-        let hyperemia = 1.0 + p.hyperemia * sig.min(1.0) * p.perfusion;
-        let supply = p.perfusion * hyperemia * (p.o2_supply * v + p.o2_bed * bq * (1.0 - block));
+        let hyperemia = 1.0 + p.hyperemia * sig.min(1.0) * perfusion;
+        let supply = perfusion * hyperemia * (p.o2_supply * v + p.o2_bed * bq * (1.0 - block));
         let d_o2 = p.d_o2 * s.oxygen[i] + supply * (1.0 - o) - p.o2_consumption * o * load;
         let hypoxia = ((p.hypoxia_threshold - o) / p.hypoxia_threshold).max(0.0);
         let oxy = sat(o, 0.2);
@@ -223,7 +235,7 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         // --- Лекарства в ткани. Антибиотик приходит с кровью: в некроз и в дно
         // с плохой перфузией он почти не попадает.
         let bed_blood = if wounded { 0.5 * bq } else { 0.0 };
-        let blood = (v + bed_blood).min(1.0) * p.perfusion;
+        let blood = (v + bed_blood).min(1.0) * perfusion;
         let perf_local = blood * (1.0 - block);
         let (mut abx_kill_s, mut abx_kill_r, mut antitoxin, mut abx_level) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
         for (k, pr) in gl.abx.iter().enumerate() {
@@ -315,7 +327,7 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
             p.d_vegf * s.vegf[i] + p.vegf_hypoxia * hypoxia * (0.1 + m1 + m2 + f) + p.vegf_m2 * m2 - p.decay_vegf * a;
 
         // --- Воспаление. Клетки выходят из сосудов края и дна раны.
-        let access = (0.3 * bq + v) * p.perfusion * (1.0 - 0.7 * block);
+        let access = (0.3 * bq + v) * perfusion * (1.0 - 0.7 * block);
         let recruit_n = p.recruit_neut * sig * access * (1.0 - n / p.max_neut).max(0.0);
         let effero = p.efferocytosis * (m1 + m2) * n;
         let d_neut = p.d_neut * s.neutrophils[i] + recruit_n - p.death_neut * n - effero;

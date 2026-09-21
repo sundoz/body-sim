@@ -11,6 +11,7 @@ mod prof;
 mod render3d;
 mod ui;
 
+use body_sim::body::BodySite;
 use body_sim::params::Scenario;
 use body_sim::report::{Metrics, View};
 use body_sim::simulation::Simulation;
@@ -20,9 +21,13 @@ use macroquad::prelude::*;
 use render3d::{OrbitCam, Scene3D};
 use ui::Ui;
 
-const GRID_W: usize = 96;
-const GRID_H: usize = 48;
-const CELL_PX: f32 = 10.0;
+/// Размеры моделируемого участка: ширина и высота в мм и сторона клетки.
+/// Крупный участок берётся более грубой сеткой, иначе шаг модели и меш поверхности
+/// перестают укладываться в кадр.
+const PATCHES: [(f32, f32, f32, &str); 3] =
+    [(24.0, 12.0, 0.25, "24×12 мм"), (48.0, 24.0, 0.25, "48×24"), (96.0, 48.0, 0.5, "96×48")];
+/// Размер окна просмотра ткани в пикселях — от размера сетки не зависит.
+const VIEW_PX: (f32, f32) = (960.0, 480.0);
 const MAX_STEPS_PER_FRAME: usize = 600;
 const SPEEDS: [(f32, &str); 6] = [(0.25, "¼"), (0.5, "½"), (1.0, "1"), (2.0, "2"), (5.0, "5"), (10.0, "10")];
 const DEPTHS: [(f32, &str, &str); 5] = [
@@ -38,7 +43,7 @@ const DRESSINGS: [(Option<f32>, &str); 3] = [(None, "нет"), (Some(12.0), "12 
 const ABX: [(Option<f32>, &str); 4] = [(None, "нет"), (Some(8.0), "8 ч"), (Some(12.0), "12 ч"), (Some(24.0), "24 ч")];
 
 fn view_rect() -> Rect {
-    Rect::new(20.0, 72.0, GRID_W as f32 * CELL_PX, GRID_H as f32 * CELL_PX)
+    Rect::new(20.0, 72.0, VIEW_PX.0, VIEW_PX.1)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -49,12 +54,16 @@ enum Shape {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
-    Patient,
+    Body,
+    Wound,
     Treatment,
 }
 
 struct App {
     scenario: Scenario,
+    site: BodySite,
+    /// Индекс в `PATCHES`.
+    patch: usize,
     shape: Shape,
     size_mm: f32,
     depth_mm: f32,
@@ -81,21 +90,23 @@ impl App {
     fn new(scenario: Scenario) -> Self {
         let mut app = Self {
             scenario,
+            site: BodySite::Forearm,
+            patch: 0,
             shape: Shape::Circle,
             size_mm: 4.0,
             depth_mm: 2.5,
-            sim: Self::make_sim(scenario, Shape::Circle, 4.0, 2.5),
+            sim: Self::make_sim(scenario, BodySite::Forearm, 0, Shape::Circle, 4.0, 2.5),
             playing: true,
             speed: 1.0,
             pending_steps: 0.0,
             view: None,
             cut: true,
-            cut_row: GRID_H / 2,
+            cut_row: 24,
             orbiting: false,
             last_mouse: Vec2::ZERO,
             brush_mm: 1.0,
             visible: chart::DEFAULT_VISIBLE,
-            tab: Tab::Patient,
+            tab: Tab::Body,
             agent: Antiseptic::Octenidine,
             dressing: None,
             abx: [None; 3],
@@ -104,18 +115,35 @@ impl App {
         app
     }
 
-    fn make_sim(scenario: Scenario, shape: Shape, size_mm: f32, depth_mm: f32) -> Simulation {
-        let p = scenario.params();
+    fn make_sim(
+        scenario: Scenario,
+        site: BodySite,
+        patch: usize,
+        shape: Shape,
+        size_mm: f32,
+        depth_mm: f32,
+    ) -> Simulation {
+        let (aw, ah, cell, _) = PATCHES[patch];
+        let mut p = scenario.params_at(site);
+        p.cell_mm = cell;
+        p.fit_dt();
         let r = size_mm / p.cell_mm;
         let shape = match shape {
             Shape::Circle => WoundShape::Circle { radius: r },
             Shape::Cut => WoundShape::Cut { half_length: 2.0 * r, half_width: 1.0 / p.cell_mm },
         };
-        Simulation::new(p, GRID_W, GRID_H, shape, depth_mm)
+        let (w, h) = ((aw / cell).round() as usize, (ah / cell).round() as usize);
+        let depth_mm = depth_mm.min(p.max_depth_mm);
+        Simulation::new(p, w, h, shape, depth_mm)
+    }
+
+    fn grid(&self) -> (usize, usize) {
+        (self.sim.tissue.w, self.sim.tissue.h)
     }
 
     fn reset(&mut self) {
-        self.sim = Self::make_sim(self.scenario, self.shape, self.size_mm, self.depth_mm);
+        self.sim = Self::make_sim(self.scenario, self.site, self.patch, self.shape, self.size_mm, self.depth_mm);
+        self.cut_row = self.sim.tissue.h / 2;
         self.pending_steps = 0.0;
         self.dressing = None;
         self.abx = [None; 3];
@@ -226,7 +254,7 @@ fn gy_limit(app: &App) -> f32 {
     if app.cut {
         app.cut_row as f32
     } else {
-        GRID_H as f32 - 0.5
+        app.sim.tissue.h as f32 - 0.5
     }
 }
 
@@ -257,7 +285,7 @@ fn camera_input(ui: &Ui, app: &mut App, scene: &mut Scene3D) {
     if is_key_pressed(KeyCode::Up) && app.cut_row > 0 {
         app.cut_row -= 1;
     }
-    if is_key_pressed(KeyCode::Down) && app.cut_row + 1 < GRID_H {
+    if is_key_pressed(KeyCode::Down) && app.cut_row + 1 < app.sim.tissue.h {
         app.cut_row += 1;
     }
 }
@@ -336,9 +364,10 @@ fn draw_tissue_3d(ui: &Ui, app: &mut App, scene: &mut Scene3D, prof: &mut prof::
     );
 
     pick.map(|p| {
-        let ix = (p.gx.round().max(0.0) as usize).min(GRID_W - 1);
-        let iy = (p.gy.round().max(0.0) as usize).min(GRID_H - 1);
-        iy * GRID_W + ix
+        let (gw, gh) = (app.sim.tissue.w, app.sim.tissue.h);
+        let ix = (p.gx.round().max(0.0) as usize).min(gw - 1);
+        let iy = (p.gy.round().max(0.0) as usize).min(gh - 1);
+        iy * gw + ix
     })
 }
 
@@ -419,8 +448,8 @@ fn draw_view_chips(ui: &Ui, app: &mut App, scene: &mut Scene3D) {
 fn draw_tooltip(ui: &Ui, app: &App, i: usize) {
     let t = &app.sim.tissue;
     let p = &app.sim.p;
-    let x_mm = (i % GRID_W) as f32 * p.cell_mm;
-    let y_mm = (i / GRID_W) as f32 * p.cell_mm;
+    let x_mm = (i % t.w) as f32 * p.cell_mm;
+    let y_mm = (i / t.w) as f32 * p.cell_mm;
     let rows = [
         ("Глубина полости / макс.", format!("{:.1} / {:.1} мм", t.depth.data[i], t.depth_max.data[i])),
         ("Слой дна", p.layer_title(t.depth_max.data[i]).to_string()),
@@ -496,19 +525,60 @@ fn dots(n: f32) -> String {
     "●".repeat(k) + &"○".repeat(4 - k)
 }
 
-fn draw_patient_tab(ui: &Ui, app: &mut App, x: f32, mut y: f32, iw: f32) {
+fn draw_body_tab(ui: &Ui, app: &mut App, x: f32, mut y: f32, iw: f32) {
+    ui.section("МЕСТО НА ТЕЛЕ", x, y);
+    y += 20.0;
+    let quarter = (iw - 18.0) / 4.0;
+    for (k, site) in BodySite::ALL.iter().enumerate() {
+        let r = Rect::new(x + (k % 4) as f32 * (quarter + 6.0), y + (k / 4) as f32 * 32.0, quarter, 28.0);
+        if ui.button_sized(r, site.short(), app.site == *site, 13) && app.site != *site {
+            app.site = *site;
+            app.reset();
+        }
+    }
+    y += 68.0;
+    ui.text(app.site.note(), x, y + 11.0, 12, ui::MUTED);
+    y += 20.0;
+    let p = &app.sim.p;
+    let anatomy = format!(
+        "эпидермис {:.2} · дерма {:.1} · клетчатка {:.0} мм · кровоток ×{:.2}",
+        p.epidermis_mm, p.dermis_mm, p.fat_mm, p.site_perfusion
+    );
+    ui.text(&anatomy, x, y + 11.0, 12, ui::MUTED);
+    y += 26.0;
+
+    ui.section("УЧАСТОК КОЖИ", x, y);
+    y += 20.0;
+    let patches: Vec<(usize, &str)> = PATCHES.iter().enumerate().map(|(k, (_, _, _, l))| (k, *l)).collect();
+    if let Some(k) = button_row(ui, x, y, iw, &patches, app.patch) {
+        app.patch = k;
+        app.reset();
+    }
+    y += 34.0;
+    let (gw, gh) = app.grid();
+    let region = app.site.region_cm2();
+    ui.text(
+        &format!("{gw}×{gh} клеток по {:.2} мм · вся область {region:.0} см²", app.sim.p.cell_mm),
+        x,
+        y + 11.0,
+        12,
+        ui::MUTED,
+    );
+    y += 26.0;
+
     ui.section("СЦЕНАРИЙ", x, y);
     y += 20.0;
     let half = (iw - 6.0) / 2.0;
     for (k, s) in Scenario::ALL.iter().enumerate() {
-        let r = Rect::new(x + (k % 2) as f32 * (half + 6.0), y + (k / 2) as f32 * 36.0, half, 30.0);
+        let r = Rect::new(x + (k % 2) as f32 * (half + 6.0), y + (k / 2) as f32 * 34.0, half, 29.0);
         if ui.button_sized(r, s.short(), app.scenario == *s, 14) && app.scenario != *s {
             app.scenario = *s;
             app.reset();
         }
     }
-    y += Scenario::ALL.len().div_ceil(2) as f32 * 36.0 + 6.0;
+}
 
+fn draw_wound_tab(ui: &Ui, app: &mut App, x: f32, mut y: f32, iw: f32) {
     ui.section("РАНА", x, y);
     y += 20.0;
     if let Some(s) = button_row(ui, x, y, iw, &[(Shape::Circle, "Круглая"), (Shape::Cut, "Разрез")], app.shape)
@@ -646,7 +716,7 @@ fn draw_metrics(ui: &Ui, m: &Metrics, x: f32, mut y: f32, iw: f32) {
     } else {
         "не задета".to_string()
     };
-    let rows: [(&str, String, f32, Color); 12] = [
+    let rows: [(&str, String, f32, Color); 13] = [
         ("Открытая площадь", format!("{:.1} из {:.1} мм²", m.open_mm2, m.wound_mm2), m.open_fraction, c(0)),
         ("Глубина полости", format!("{:.1} мм (макс. {:.1})", m.depth, m.depth_max), m.depth / 5.0, c(1)),
         ("Некроз", format!("{:.1} мм²", m.necrotic_mm2), m.necrotic_mm2 / m.wound_mm2.max(1.0), c(2)),
@@ -659,6 +729,12 @@ fn draw_metrics(ui: &Ui, m: &Metrics, x: f32, mut y: f32, iw: f32) {
         ("Мышца", muscle, m.muscle_regen, Color::new(0.80, 0.30, 0.34, 1.0)),
         ("Клетчатка", fat, m.fat_regen, Color::new(0.96, 0.80, 0.40, 1.0)),
         ("Прочность рубца", format!("{:.0}%", m.strength * 100.0), m.strength, c(12)),
+        (
+            "Доля поверхности тела",
+            format!("{:.2}% · инф. {:.2}%", m.tbsa_percent, m.infected_tbsa_percent),
+            m.tbsa_percent / 10.0,
+            c(4),
+        ),
     ];
     for (name, val, frac, color) in rows.iter() {
         metric_row(ui, x, y, iw, &MetricRow { name, value: val, frac: *frac, color: *color });
@@ -672,15 +748,15 @@ fn draw_panel(ui: &Ui, app: &mut App) {
     let x = pr.x + 16.0;
     let iw = pr.w - 32.0;
 
-    let tw = iw / 2.0;
-    if ui.tab(Rect::new(x, pr.y + 6.0, tw, 34.0), "Пациент и рана", app.tab == Tab::Patient) {
-        app.tab = Tab::Patient;
-    }
-    if ui.tab(Rect::new(x + tw, pr.y + 6.0, tw, 34.0), "Лечение", app.tab == Tab::Treatment) {
-        app.tab = Tab::Treatment;
+    let tw = iw / 3.0;
+    for (k, (tab, label)) in [(Tab::Body, "Тело"), (Tab::Wound, "Рана"), (Tab::Treatment, "Лечение")].iter().enumerate()
+    {
+        if ui.tab(Rect::new(x + k as f32 * tw, pr.y + 6.0, tw, 34.0), label, app.tab == *tab) {
+            app.tab = *tab;
+        }
     }
 
-    // Время — общее для обеих вкладок.
+    // Время — общее для всех вкладок.
     let mut y = pr.y + 52.0;
     let play_label = if app.playing { "Пауза" } else { "Пуск" };
     if ui.button_sized(Rect::new(x, y, 84.0, 30.0), play_label, !app.playing, 14) {
@@ -693,18 +769,20 @@ fn draw_panel(ui: &Ui, app: &mut App) {
     y += 44.0;
 
     match app.tab {
-        Tab::Patient => draw_patient_tab(ui, app, x, y, iw),
+        Tab::Body => draw_body_tab(ui, app, x, y, iw),
+        Tab::Wound => draw_wound_tab(ui, app, x, y, iw),
         Tab::Treatment => draw_treatment_tab(ui, app, x, y, iw),
     }
 
     let m = app.sim.latest().clone();
-    draw_metrics(ui, &m, x, pr.y + pr.h - 22.0 - 12.0 * 24.0 - 14.0, iw);
+    draw_metrics(ui, &m, x, pr.y + pr.h - 22.0 - 13.0 * 24.0 - 14.0, iw);
 }
 
 // ---------------------------------------------------------------- запуск
 
 struct Opts {
     scenario: Scenario,
+    site: Option<BodySite>,
     depth: f32,
     view: Option<View>,
     cut: bool,
@@ -726,6 +804,7 @@ struct Opts {
 fn parse_opts() -> Opts {
     let mut o = Opts {
         scenario: Scenario::Healthy,
+        site: None,
         depth: 2.5,
         view: None,
         cut: true,
@@ -750,6 +829,7 @@ fn parse_opts() -> Opts {
                 let v = args.next().unwrap_or_default();
                 match a.as_str() {
                     "--scenario" => o.scenario = Scenario::parse(&v).unwrap_or(Scenario::Healthy),
+                    "--site" => o.site = BodySite::parse(&v),
                     // Глубже колонки ткани нельзя: модель всё равно обрежет полость по max_depth_mm.
                     "--depth" => o.depth = v.parse().map_or(2.5, |d: f32| d.clamp(0.0, MAX_DEPTH_MM)),
                     "--view" => o.view = View::parse(&v),
@@ -814,6 +894,10 @@ async fn main() {
     if opts.treat_tab {
         app.tab = Tab::Treatment;
     }
+    if let Some(site) = opts.site {
+        app.site = site;
+        app.reset();
+    }
     if let Some(a) = opts.antiseptic {
         app.agent = a;
         app.set_dressing(Some(24.0));
@@ -835,7 +919,8 @@ async fn main() {
         app.playing = false;
     }
 
-    let mut scene = Scene3D::new(&app.sim.p, GRID_W, GRID_H);
+    let (gw, gh) = app.grid();
+    let mut scene = Scene3D::new(&app.sim.p, gw, gh);
     if opts.top {
         scene.cam = OrbitCam::top();
     }
@@ -867,6 +952,15 @@ async fn main() {
         if is_key_pressed(KeyCode::Right) && !app.playing {
             let n = app.sim.steps_per_hour();
             app.sim.run_steps(n);
+        }
+        // Смена места на теле или размера участка меняет геометрию блока — пересобираем сцену,
+        // сохраняя положение камеры.
+        let (gw, gh) = app.grid();
+        if !scene.matches(&app.sim.p, gw, gh) {
+            let cam = scene.cam;
+            scene = Scene3D::new(&app.sim.p, gw, gh);
+            scene.cam = cam;
+            app.cut_row = app.cut_row.min(gh - 1);
         }
         camera_input(&ui, &mut app, &mut scene);
         let dt = if opts.bench.is_some() { 1.0 / 60.0 } else { get_frame_time() };

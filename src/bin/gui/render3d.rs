@@ -10,14 +10,21 @@ use rayon::prelude::*;
 
 use crate::paint::{self, CellLook, SectionGeom};
 
-/// Во сколько раз сетка поверхности детальнее сетки модели.
-const SUB: usize = 3;
-/// Глубина блока, мм.
-pub const BLOCK_DEPTH: f32 = 12.0;
-const TEX_PX_PER_MM: f32 = 36.0;
+/// Во сколько раз сетка поверхности детальнее сетки модели (на мелкой сетке снижается).
+const MAX_SUB: usize = 3;
+/// Индексы меша — u16, поэтому вершин в одном меше строго меньше 65536.
+const MAX_VERTICES: usize = 65_000;
 const TEX_TOP_MM: f32 = 1.0;
-const TEX_H: usize = 480;
+const TEX_PX_PER_MM: f32 = 36.0;
 const TEX_PX_PER_CELL: usize = 10;
+/// Пределы текстуры среза: на крупной сетке разрешение снижается, чтобы не раздувать память.
+const MAX_TEX_W: usize = 2048;
+const MAX_TEX_H: usize = 1024;
+
+/// Насколько детальнее сетки модели можно строить поверхность, чтобы меш влез в u16.
+fn pick_sub(w: usize, h: usize) -> usize {
+    (1..=MAX_SUB).rev().find(|s| (w * s + 1) * (h * s + 1) < MAX_VERTICES).unwrap_or(1)
+}
 
 const VERTEX: &str = r#"#version 100
 attribute vec3 position;
@@ -193,8 +200,16 @@ struct Face {
 
 impl Face {
     fn new(p: &Params, cells_along: usize, seed: u32) -> Self {
-        let geom =
-            SectionGeom { w: cells_along * TEX_PX_PER_CELL, h: TEX_H, top_mm: TEX_TOP_MM, px_per_mm: TEX_PX_PER_MM };
+        // Текстура должна покрыть всю колонку ткани: на животе она вдвое глубже, чем на голени.
+        let depth_mm = p.max_depth_mm + TEX_TOP_MM;
+        let px_per_cell = (MAX_TEX_W / cells_along.max(1)).clamp(1, TEX_PX_PER_CELL);
+        let px_per_mm = TEX_PX_PER_MM.min(MAX_TEX_H as f32 / depth_mm);
+        let geom = SectionGeom {
+            w: cells_along * px_per_cell,
+            h: (depth_mm * px_per_mm).ceil() as usize,
+            top_mm: TEX_TOP_MM,
+            px_per_mm,
+        };
         let mut base = vec![0u8; geom.w * geom.h * 4];
         paint::paint_base(p, cells_along, &geom, &mut base, seed);
         let tex = Texture2D::from_rgba8(geom.w as u16, geom.h as u16, &base);
@@ -226,6 +241,10 @@ pub struct Scene3D {
     w: usize,
     h: usize,
     cell_mm: f32,
+    /// Глубина блока, мм — вся моделируемая колонка ткани.
+    block_depth: f32,
+    /// Во сколько раз меш поверхности детальнее сетки модели.
+    sub: usize,
     looks: Vec<CellLook>,
     zs: Vec<f32>,
     surface: Mesh,
@@ -258,7 +277,7 @@ fn to_u8(c: f32) -> u8 {
 }
 
 /// Полупрозрачное тёмное пятно под блоком, чтобы он «стоял», а не висел в воздухе.
-fn shadow_mesh(hw: f32, hh: f32) -> Mesh {
+fn shadow_mesh(hw: f32, hh: f32, block_depth: f32) -> Mesh {
     let n = 24;
     let (ex, ez) = (hw + 6.0, hh + 6.0);
     let mut vertices = Vec::with_capacity((n + 1) * (n + 1));
@@ -271,7 +290,7 @@ fn shadow_mesh(hw: f32, hh: f32) -> Mesh {
             let dz = (z.abs() - hh).max(0.0);
             let d = (dx * dx + dz * dz).sqrt();
             let a = (0.55 * (1.0 - d / 6.0).clamp(0.0, 1.0).powi(2) * 255.0) as u8;
-            vertices.push(vertex(vec3(x, -BLOCK_DEPTH - 0.05, z), vec2(0.0, 0.0), [0, 0, 0, a], Vec4::ZERO));
+            vertices.push(vertex(vec3(x, -block_depth - 0.05, z), vec2(0.0, 0.0), [0, 0, 0, a], Vec4::ZERO));
         }
     }
     let mut indices = Vec::with_capacity(n * n * 6);
@@ -319,10 +338,12 @@ impl Scene3D {
             w,
             h,
             cell_mm,
+            block_depth: p.max_depth_mm,
+            sub: pick_sub(w, h),
             looks: vec![CellLook::default(); w * h],
             zs: vec![0.0; w * h],
             surface: Mesh { vertices: Vec::new(), indices: Vec::new(), texture: None },
-            shadow: shadow_mesh(w as f32 * cell_mm / 2.0, h as f32 * cell_mm / 2.0),
+            shadow: shadow_mesh(w as f32 * cell_mm / 2.0, h as f32 * cell_mm / 2.0, p.max_depth_mm),
             front: Face::new(p, w, 1),
             back: Face::new(p, w, 2),
             left: Face::new(p, h, 3),
@@ -332,6 +353,12 @@ impl Scene3D {
             last_key: None,
             timings: [0.0; 3],
         }
+    }
+
+    /// Подходит ли уже собранная сцена под эту ткань: место на теле меняет и размер
+    /// сетки, и глубину колонки, а значит и всю геометрию блока.
+    pub fn matches(&self, p: &Params, w: usize, h: usize) -> bool {
+        self.w == w && self.h == h && self.block_depth == p.max_depth_mm && self.cell_mm == p.cell_mm
     }
 
     fn half_w(&self) -> f32 {
@@ -448,15 +475,15 @@ impl Scene3D {
     }
     /// Непрерывные координаты сетки вдоль x: от левого края блока (-0.5) до правого (w - 0.5).
     fn xs(&self) -> Vec<f32> {
-        let n = self.w * SUB;
-        (0..=n).map(|k| k as f32 / SUB as f32 - 0.5).collect()
+        let n = self.w * self.sub;
+        (0..=n).map(|k| k as f32 / self.sub as f32 - 0.5).collect()
     }
 
     fn zs_until(&self, gy_cut: f32) -> Vec<f32> {
         let mut v: Vec<f32> = Vec::new();
         let mut k = 0usize;
         loop {
-            let g = k as f32 / SUB as f32 - 0.5;
+            let g = k as f32 / self.sub as f32 - 0.5;
             if g >= gy_cut - 1e-3 {
                 break;
             }
@@ -522,7 +549,7 @@ impl Scene3D {
     fn build_faces(&mut self, gy_cut: f32) {
         let xs = self.xs();
         let zs = self.zs_until(gy_cut);
-        let bottom = -BLOCK_DEPTH;
+        let bottom = -self.block_depth;
         let white = [255, 255, 255, 0];
 
         // Передняя грань (срез) и задняя: вдоль x.
@@ -648,7 +675,7 @@ impl Scene3D {
         let step = 0.05;
         for _ in 0..4000 {
             pt += dir * step;
-            if pt.y < -BLOCK_DEPTH - 1.0 {
+            if pt.y < -self.block_depth - 1.0 {
                 break;
             }
             let gx = (pt.x + self.half_w()) / self.cell_mm - 0.5;
@@ -692,10 +719,10 @@ mod tests {
 
     #[test]
     fn shadow_is_darkest_under_the_block() {
-        let m = shadow_mesh(12.0, 6.0);
+        let m = shadow_mesh(12.0, 6.0, 12.0);
         let center = m.vertices.iter().min_by(|a, b| a.position.length().total_cmp(&b.position.length())).unwrap();
         let corner = m.vertices.iter().max_by(|a, b| a.position.length().total_cmp(&b.position.length())).unwrap();
         assert!(center.color[3] > 100 && corner.color[3] == 0);
-        assert!(m.vertices.iter().all(|v| (v.position.y + BLOCK_DEPTH).abs() < 0.1));
+        assert!(m.vertices.iter().all(|v| (v.position.y + 12.0).abs() < 0.1));
     }
 }

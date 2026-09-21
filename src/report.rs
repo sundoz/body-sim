@@ -1,3 +1,4 @@
+use crate::body::{BodySite, BODY_SURFACE_CM2};
 use crate::params::Params;
 use crate::tissue::Tissue;
 
@@ -43,7 +44,29 @@ pub struct Metrics {
     pub muscle_fibrosis: f32,
     /// Какая доля утраченной клетчатки вернулась жиром.
     pub fat_regen: f32,
+
+    // Привязка к телу
+    pub site: BodySite,
+    /// Площадь моделируемого участка кожи, мм².
+    pub patch_mm2: f32,
+    /// Площадь всего поражения на теле, см² (участок — его представительный кусок).
+    pub lesion_cm2: f32,
+    /// Какая доля этой области тела поражена, %.
+    pub lesion_percent: f32,
+    /// Какую долю всей поверхности тела занимает поражение, %.
+    pub tbsa_percent: f32,
+    /// Какую долю поверхности тела занимает инфицированная ткань, %.
+    pub infected_tbsa_percent: f32,
 }
+
+/// Инфекция захватила больше половины моделируемого участка — она вышла из-под
+/// местного контроля. Доля, а не абсолютная площадь: иначе порог зависел бы от
+/// размера сетки. При участке 24×12 мм это прежние 150 мм².
+const SEPSIS_PATCH_FRACTION: f32 = 150.0 / 288.0;
+
+/// Обширное поражение даёт системную реакцию независимо от местного контроля.
+/// Порог грубый: модель организма сюда не входит, это оценка по площади.
+const SEPSIS_TBSA_PERCENT: f32 = 10.0;
 
 /// Порог бактериальной нагрузки, выше которого ткань считается инфицированной.
 const INFECTED: f32 = 0.2;
@@ -53,7 +76,14 @@ const NECROTIC: f32 = 0.2;
 impl Metrics {
     pub fn measure(t: &Tissue, p: &Params, hours: f32) -> Self {
         let cell_mm = p.cell_mm;
-        let mut m = Metrics { hours, abx: t.abx_plasma, abx_plasma: t.abx_plasma.iter().sum(), ..Default::default() };
+        let mut m = Metrics {
+            hours,
+            abx: t.abx_plasma,
+            abx_plasma: t.abx_plasma.iter().sum(),
+            site: p.site,
+            patch_mm2: t.len() as f32 * cell_mm * cell_mm,
+            ..Default::default()
+        };
         let (mut mus_w, mut fat_w) = (0.0f32, 0.0f32);
         let area = cell_mm * cell_mm;
         let mut count = 0usize;
@@ -142,7 +172,25 @@ impl Metrics {
         m.open_mm2 = open as f32 * area;
         // Долю устойчивых показываем, только когда популяция заметна.
         m.resistant_fraction = if b_all > 5.0 { br_all / b_all } else { 0.0 };
+        m.measure_body(p);
         m
+    }
+
+    /// Пересчитать площади с участка на всё тело. Моделируемый участок — представительный
+    /// кусок поражения: если задана доля поражённой области, доли по участку переносятся
+    /// на её настоящую площадь; иначе поражение считается равным самому участку.
+    fn measure_body(&mut self, p: &Params) {
+        let region_mm2 = self.site.region_cm2() * 100.0;
+        let lesion_mm2 = match p.lesion_percent {
+            Some(pct) => region_mm2 * pct.clamp(0.0, 100.0) / 100.0,
+            None => self.wound_mm2,
+        };
+        self.lesion_cm2 = lesion_mm2 / 100.0;
+        self.lesion_percent = if region_mm2 > 0.0 { lesion_mm2 / region_mm2 * 100.0 } else { 0.0 };
+        self.tbsa_percent = lesion_mm2 / (BODY_SURFACE_CM2 * 100.0) * 100.0;
+        // Какая доля поражения инфицирована — меряется по участку, переносится на его площадь.
+        let infected_share = if self.patch_mm2 > 0.0 { self.infected_mm2 / self.patch_mm2 } else { 0.0 };
+        self.infected_tbsa_percent = self.tbsa_percent * infected_share.min(1.0);
     }
 
     pub fn phase(&self) -> Phase {
@@ -164,7 +212,9 @@ impl Metrics {
 
     /// Клиническая оценка состояния раны.
     pub fn condition(&self) -> Condition {
-        if self.infected_mm2 > 150.0 {
+        if self.infected_mm2 > SEPSIS_PATCH_FRACTION * self.patch_mm2
+            || self.infected_tbsa_percent > SEPSIS_TBSA_PERCENT
+        {
             Condition::Sepsis
         } else if self.infected_mm2 > 1.2 * self.wound_mm2 + 10.0
             || (self.wound_mm2 > 1.5 * self.initial_wound_mm2 + 10.0 && self.infected_mm2 > 0.5 * self.wound_mm2)
@@ -181,15 +231,21 @@ impl Metrics {
         }
     }
 
-    pub const CSV_HEADER: &'static str = "hours,day,phase,condition,wound_mm2,open_fraction,open_mm2,depth,depth_max,necrotic_mm2,infected_mm2,bacteria,resistant_fraction,biofilm,abx_plasma,lost_muscle_mm,muscle_regen,muscle_fibrosis,lost_fat_mm,fat_regen,bleeding,clot,debris,neutrophils,m1,m2,fibroblasts,collagen,maturity,vessels,oxygen,epithelium,strength,integrity";
+    pub const CSV_HEADER: &'static str = "hours,day,phase,condition,site,patch_mm2,lesion_cm2,lesion_percent,tbsa_percent,infected_tbsa_percent,wound_mm2,open_fraction,open_mm2,depth,depth_max,necrotic_mm2,infected_mm2,bacteria,resistant_fraction,biofilm,abx_plasma,lost_muscle_mm,muscle_regen,muscle_fibrosis,lost_fat_mm,fat_regen,bleeding,clot,debris,neutrophils,m1,m2,fibroblasts,collagen,maturity,vessels,oxygen,epithelium,strength,integrity";
 
     pub fn csv_row(&self) -> String {
         format!(
-            "{:.1},{:.3},{},{},{:.2},{:.4},{:.3},{:.3},{:.3},{:.2},{:.2},{:.4},{:.4},{:.4},{:.3},{:.2},{:.4},{:.4},{:.2},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
+            "{:.1},{:.3},{},{},{},{:.2},{:.3},{:.3},{:.4},{:.4},{:.2},{:.4},{:.3},{:.3},{:.3},{:.2},{:.2},{:.4},{:.4},{:.4},{:.3},{:.2},{:.4},{:.4},{:.2},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}",
             self.hours,
             self.hours / 24.0,
             self.phase().key(),
             self.condition().key(),
+            self.site.key(),
+            self.patch_mm2,
+            self.lesion_cm2,
+            self.lesion_percent,
+            self.tbsa_percent,
+            self.infected_tbsa_percent,
             self.wound_mm2,
             self.open_fraction,
             self.open_mm2,
@@ -450,6 +506,14 @@ pub fn print_snapshot(m: &Metrics, map: Option<&str>) {
         m.condition().title()
     );
     println!(
+        "  {} · поражено {:.1} см² ({:.1}% области, {:.2}% поверхности тела), инфицировано {:.2}% тела",
+        m.site.title(),
+        m.lesion_cm2,
+        m.lesion_percent,
+        m.tbsa_percent,
+        m.infected_tbsa_percent
+    );
+    println!(
         "  рана {:>5.1} мм², открыто {:>5.1} мм² ({:>3.0}%) | глубина {:.1} мм (макс {:.1}) | некроз {:.1} мм² | инфицировано {:.1} мм²",
         m.wound_mm2,
         m.open_mm2,
@@ -530,8 +594,14 @@ mod tests {
 
     #[test]
     fn condition_classification() {
-        let base =
-            Metrics { wound_mm2: 50.0, initial_wound_mm2: 50.0, open_fraction: 0.8, hours: 24.0, ..Default::default() };
+        let base = Metrics {
+            wound_mm2: 50.0,
+            initial_wound_mm2: 50.0,
+            open_fraction: 0.8,
+            hours: 24.0,
+            patch_mm2: 288.0,
+            ..Default::default()
+        };
         let with = |f: &dyn Fn(&mut Metrics)| {
             let mut m = base.clone();
             f(&mut m);
@@ -566,6 +636,46 @@ mod tests {
         assert_eq!(with(&|m| m.hours = 31.0 * 24.0), Condition::Chronic);
         assert_eq!(with(&|m| m.biofilm = 0.6), Condition::Chronic);
         assert!(Condition::Sepsis > Condition::Necrosis && Condition::Necrosis > Condition::Healing);
+        // Обширное поражение даёт системную реакцию даже при умеренной доле инфекции на участке.
+        assert_eq!(with(&|m| m.infected_tbsa_percent = 12.0), Condition::Sepsis);
+    }
+
+    #[test]
+    fn severity_threshold_does_not_depend_on_grid_size() {
+        // Раньше порог был абсолютным (150 мм²), и на вдвое большем участке
+        // та же доля инфицированной ткани давала другой диагноз.
+        let at = |patch: f32| {
+            Metrics {
+                wound_mm2: 50.0,
+                initial_wound_mm2: 50.0,
+                open_fraction: 0.8,
+                hours: 24.0,
+                patch_mm2: patch,
+                infected_mm2: 0.6 * patch,
+                ..Default::default()
+            }
+            .condition()
+        };
+        assert_eq!(at(288.0), Condition::Sepsis);
+        assert_eq!(at(2400.0), at(288.0), "диагноз не должен зависеть от размера сетки");
+    }
+
+    #[test]
+    fn body_areas_scale_from_the_patch_to_the_whole_body() {
+        let p = Params { site: BodySite::Back, lesion_percent: Some(50.0), ..Params::default() };
+        let mut t = Tissue::healthy(96, 48, &p);
+        t.injure(crate::tissue::WoundShape::Circle { radius: 16.0 }, 2.5, &p);
+        let m = Metrics::measure(&t, &p, 0.0);
+        assert!((m.patch_mm2 - 288.0).abs() < 1e-3, "участок 24×12 мм");
+        // Половина спины — это 6.5% поверхности тела.
+        assert!((m.lesion_percent - 50.0).abs() < 1e-3);
+        assert!((m.tbsa_percent - 6.5).abs() < 0.01, "{}", m.tbsa_percent);
+        assert!((m.lesion_cm2 - BodySite::Back.region_cm2() / 2.0).abs() < 1.0);
+        // Без указанной доли поражение равно самому участку.
+        let p = Params { site: BodySite::Back, ..Params::default() };
+        let m = Metrics::measure(&t, &p, 0.0);
+        assert!((m.lesion_cm2 - m.wound_mm2 / 100.0).abs() < 1e-4);
+        assert!(m.tbsa_percent < 0.01, "рана Ø8 мм — ничтожная доля поверхности тела");
     }
 
     #[test]
