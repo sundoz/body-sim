@@ -41,7 +41,8 @@ cargo run --release
 - Performance: `--bench 300` — 300 frames at maximum speed with a per-section timing table.
   The model step and section rendering run in parallel (`rayon`), and the scene is rebuilt only
   when the tissue changes; on a Ryzen 5 5600H — ~13 ms per frame at 10 days/s (60 FPS),
-  90 simulated days in the console — 3.7 s.
+  90 simulated days in the console — 3.7 s. See [Performance](#performance) for what the step
+  actually spends its time on.
 
 ## Console mode
 
@@ -63,7 +64,7 @@ cargo run --release --bin body-sim -- --help
 cargo test
 ```
 
-106 tests, ~2.5 min; CI (GitHub Actions) runs them on Ubuntu and Windows on every push,
+107 tests, ~2.5 min; CI (GitHub Actions) runs them on Ubuntu and Windows on every push,
 plus `cargo fmt --check` and `cargo clippy -D warnings`.
 Unit test coverage: `cargo llvm-cov --release --lib --bins` (~20 s) — the model core is 83–100%,
 58% overall (the window, the buttons and the 3D rendering need a GPU and are not covered).
@@ -260,6 +261,40 @@ Frequent application of cytotoxic antiseptics holds healing back more than it he
 | diabetic-foot + vancomycin alone | the necrosis stays: without debridement an antibiotic does not help |
 | diabetic-foot + surgery + octenidine + an antibiotic | infection and necrosis cleared, the wound stays chronic because of the ischemia |
 | ischemic + hydrogel | dry gangrene remains: blood flow was never restored |
+
+## Performance
+
+The step kernel is about half of all instructions and its cost is spread evenly — the most
+expensive single line is under 2%, so there is nothing to micro-optimize. What did pay off was
+removing work the compiler was doing on our behalf:
+
+- Slice bounds checks were **31% of all instructions**. The chunk confirms its slice lengths once
+  per block and the Laplacians are sliced to the same range, after which the checks disappear
+  (0.3%, all of it in the metrics pass).
+- The Laplacian was not vectorized at all: with offset indexing (`row[x - 1]`) the compiler could
+  not prove the slices do not overlap and emitted scalar code. Written as equal-length slices it
+  vectorizes, and the row edges are handled separately so the inner loop has no branches either.
+
+Together that is **−29% instructions** (4.19 → 2.96 billion on a two-day run), worth 5% of wall
+time on the default 24×12 mm patch and 12% on a 60×40 mm one. The gap between the two numbers is
+the interesting part: the kernel is bound by memory and latency rather than by instruction count,
+so the next real lever is cutting traffic — computing the Laplacians inside the step over
+double-buffered fields, which would remove thirteen full-grid buffers and one fork-join per step.
+
+Every optimization is required to leave the model bit-identical; the reference is a 20-day
+necrotizing run hashed field by field.
+
+Two things that look like optimizations but are not:
+
+- **Skipping undisturbed cells.** Measured rather than assumed: by day 7 there is not a single
+  cell still bit-identical to untouched tissue, even on a 240×160 grid, because diffusion spreads
+  non-zero values across the whole patch within a day. There is nothing to skip, and an
+  approximate threshold would move the results and invalidate the calibration.
+- **Tuning the chunk size.** 384, 768 and 1152 cells are within noise of each other; larger
+  chunks are worse because the blocks stop balancing across threads.
+
+Parallel scaling is 3.3× on four cores for a 240×160 grid and 2.2× for 96×48, where the per-step
+work is too small to hide the cost of splitting it up.
 
 ## Architecture
 

@@ -73,6 +73,20 @@ macro_rules! chunked_fields {
             $($name: &'a mut [f32],)*
         }
 
+        impl Chunk<'_> {
+            /// Длина блока, один раз подтверждённая для всех срезов сразу.
+            /// Без этого компилятор не может связать `len` с длинами полей и вставляет
+            /// проверку границ в каждое из полусотни обращений на клетку — на профиле
+            /// это была треть всех инструкций программы.
+            #[inline]
+            fn checked_len(&self) -> usize {
+                let n = self.len;
+                assert!(self.wound_mask.len() >= n);
+                $(assert!(self.$name.len() >= n);)*
+                n
+            }
+        }
+
         fn split_chunks(t: &mut Tissue, size: usize) -> Vec<Chunk<'_>> {
             let mut wound_mask = t.wound_mask.chunks_mut(size);
             $(let mut $name = t.$name.data.chunks_mut(size);)*
@@ -182,8 +196,24 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
     let asp = &gl.asp;
     // Системная перфузия (болезнь) вместе с местной (анатомия места на теле).
     let perfusion = p.blood_supply();
-    for j in 0..ch.len {
-        let i = ch.base + j;
+    let n = ch.checked_len();
+    // Лапласианы режем по тому же блоку: индекс внутри среза известной длины
+    // не требует проверки границ, в отличие от индекса в общий массив сетки.
+    let (base, end) = (ch.base, ch.base + n);
+    let lap_signal = &s.signal[base..end];
+    let lap_gf = &s.gf[base..end];
+    let lap_vegf = &s.vegf[base..end];
+    let lap_oxygen = &s.oxygen[base..end];
+    let lap_bacteria = &s.bacteria[base..end];
+    let lap_bacteria_res = &s.bacteria_res[base..end];
+    let lap_neutrophils = &s.neutrophils[base..end];
+    let lap_m1 = &s.m1[base..end];
+    let lap_m2 = &s.m2[base..end];
+    let lap_fibroblasts = &s.fibroblasts[base..end];
+    let lap_vessels = &s.vessels[base..end];
+    let lap_epithelium = &s.epithelium[base..end];
+    let lap_toxin = &s.toxin[base..end];
+    for j in 0..n {
         let bl = ch.bleeding[j];
         let cf = ch.clot[j];
         let debris = ch.debris[j];
@@ -228,7 +258,7 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         // Воспаление расширяет сосуды (гиперемия) — но только если артерии на это способны.
         let hyperemia = 1.0 + p.hyperemia * sig.min(1.0) * perfusion;
         let supply = perfusion * hyperemia * (p.o2_supply * v + p.o2_bed * bq * (1.0 - block));
-        let d_o2 = p.d_o2 * s.oxygen[i] + supply * (1.0 - o) - p.o2_consumption * o * load;
+        let d_o2 = p.d_o2 * lap_oxygen[j] + supply * (1.0 - o) - p.o2_consumption * o * load;
         let hypoxia = ((p.hypoxia_threshold - o) / p.hypoxia_threshold).max(0.0);
         let oxy = sat(o, 0.2);
 
@@ -272,9 +302,9 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         // Биоплёнка постоянно «выпускает» планктонные бактерии.
         let shed = p.biofilm_shed * bf * crowd;
         let frac_r = if bt > 1e-6 { br / bt } else { 0.0 };
-        let d_bact = p.d_bact * s.bacteria[i] + grow_s - mutate - (immune + as_kill + abx_kill_s + larvae_kill) * b
+        let d_bact = p.d_bact * lap_bacteria[j] + grow_s - mutate - (immune + as_kill + abx_kill_s + larvae_kill) * b
             + shed * (1.0 - frac_r);
-        let d_bact_res = p.d_bact * s.bacteria_res[i] + grow_r + mutate
+        let d_bact_res = p.d_bact * lap_bacteria_res[j] + grow_r + mutate
             - (immune + as_kill + abx_kill_r + larvae_kill) * br
             + shed * frac_r;
 
@@ -292,7 +322,7 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
             + p.k_toxin * (bt - p.toxin_threshold).max(0.0) * (1.0 - 0.5 * block) * (1.0 - antitoxin)
             + p.k_toxin_field * tox;
         // Экзотоксины выделяют бактерии некротизирующих штаммов; клиндамицин выключает их синтез.
-        let d_tox = p.d_toxin * s.toxin[i] + p.toxin_production * bt * (1.0 - antitoxin) - p.toxin_decay * tox;
+        let d_tox = p.d_toxin * lap_toxin[j] + p.toxin_production * bt * (1.0 - antitoxin) - p.toxin_decay * tox;
         let room = (p.max_depth_mm - depth).max(0.0);
         let dead_mm = (death * p.necrosis_depth_mm).min(room / dt);
         // Очищение от некроза. Аутолиз: макрофаги растворяют мёртвую ткань (под влажной повязкой — быстрее).
@@ -313,7 +343,7 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         let d_debris = -(p.clear_neut * n + p.clear_mac * (m1 + m2)) * debris + death;
 
         // --- Сигналы.
-        let d_sig = p.d_signal * s.signal[i]
+        let d_sig = p.d_signal * lap_signal[j]
             + p.s_debris * debris
             + p.s_bacteria * bt
             + p.s_m1 * m1
@@ -322,29 +352,29 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
             + p.s_biofilm * bf
             - p.decay_signal * sig;
         let gfh = sat(g, p.gf_half);
-        let d_gf = p.d_gf * s.gf[i] + p.k_platelet_gf * clot_form + p.gf_m2 * m2 + p.gf_m1 * m1 - p.decay_gf * g;
+        let d_gf = p.d_gf * lap_gf[j] + p.k_platelet_gf * clot_form + p.gf_m2 * m2 + p.gf_m1 * m1 - p.decay_gf * g;
         let d_vegf =
-            p.d_vegf * s.vegf[i] + p.vegf_hypoxia * hypoxia * (0.1 + m1 + m2 + f) + p.vegf_m2 * m2 - p.decay_vegf * a;
+            p.d_vegf * lap_vegf[j] + p.vegf_hypoxia * hypoxia * (0.1 + m1 + m2 + f) + p.vegf_m2 * m2 - p.decay_vegf * a;
 
         // --- Воспаление. Клетки выходят из сосудов края и дна раны.
         let access = (0.3 * bq + v) * perfusion * (1.0 - 0.7 * block);
         let recruit_n = p.recruit_neut * sig * access * (1.0 - n / p.max_neut).max(0.0);
         let effero = p.efferocytosis * (m1 + m2) * n;
-        let d_neut = p.d_neut * s.neutrophils[i] + recruit_n - p.death_neut * n - effero;
+        let d_neut = p.d_neut * lap_neutrophils[j] + recruit_n - p.death_neut * n - effero;
 
         let recruit_m = p.recruit_mac * sig * access * (1.0 - (m1 + m2) / p.max_mac).max(0.0);
         // Переключение M1→M2 запускается поеданием апоптотических нейтрофилов
         // и подавляется бактериальной нагрузкой.
         let switch = p.switch_m1_m2 * (0.3 + sat(effero, 0.005)) / (1.0 + 10.0 * bt) * m1;
-        let d_m1 = p.d_mac * s.m1[i] + recruit_m - switch - p.death_m1 * m1;
-        let d_m2 = p.d_mac * s.m2[i] + switch - p.death_m2 * m2;
+        let d_m1 = p.d_mac * lap_m1[j] + recruit_m - switch - p.death_m1 * m1;
+        let d_m2 = p.d_mac * lap_m2[j] + switch - p.death_m2 * m2;
 
         // --- Пролиферация. Клетки мигрируют только по матриксу (сгусток или коллаген),
         // в глубоких ранах грануляции растут и со дна.
         let scaffold = (cf + c).clamp(0.05, 1.0) * (1.0 - block);
         let bed_source = if depth > 0.05 { p.bed_fib * bq * gfh * (1.0 - f).max(0.0) * (1.0 - block) } else { 0.0 };
         let d_fib =
-            p.d_fib * s.fibroblasts[i] * scaffold + p.prolif_fib * f * gfh * oxy * (1.0 - f / p.max_fib) + bed_source
+            p.d_fib * lap_fibroblasts[j] * scaffold + p.prolif_fib * f * gfh * oxy * (1.0 - f / p.max_fib) + bed_source
                 - p.fib_return * (f - p.fib_baseline) * c
                 - asp.tox_fib * asc * f;
         // --- Глубокие слои. Мышца: клетки-сателлиты строят новые волокна, если дефект небольшой,
@@ -376,7 +406,7 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         // MMP макрофагов перестраивают только повреждённую дерму.
         let degrade = p.collagen_degr_m1 * m1 * c * (1.0 - p.residual_dermis(dmax)) + 0.5 * death * c;
 
-        let d_vessel = (p.d_vessel * s.vessels[i] + p.angio_rate * sat(a, p.vegf_half) * v * (1.0 - v)) * scaffold
+        let d_vessel = (p.d_vessel * lap_vessels[j] + p.angio_rate * sat(a, p.vegf_half) * v * (1.0 - v)) * scaffold
             - 0.5 * asp.tox_fib * asc * v * (1.0 - e);
 
         // Эпителий наползает только на выровненное грануляциями дно;
@@ -387,7 +417,7 @@ fn step_chunk(ch: &mut Chunk, s: &Scratch, p: &Params, gl: &Globals) {
         // Во влажной среде (гидрогель) кератиноциты мигрируют быстрее.
         let moist = if gl.hydrogel { 1.3 } else { 1.0 };
         let d_epi = moist
-            * (p.d_epi * s.epithelium[i]
+            * (p.d_epi * lap_epithelium[j]
                 + p.epi_rate * e * (1.0 - e) * (0.5 + 0.5 * gfh) * oxy / (1.0 + bt / p.epi_bact_half))
             * epi_scaffold
             + p.adnexal_rate * islands * (1.0 - e) * level * (1.0 - block) * oxy / (1.0 + bt / p.epi_bact_half)
