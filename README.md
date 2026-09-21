@@ -25,7 +25,9 @@ cargo run --release
 - **Mouse**: left button — inflict a wound of the selected depth, right button — orbit the camera,
   wheel — zoom, Shift+wheel — brush size, ↑/↓ — move the cutting plane, Tab — section on/off.
   Hovering shows every value at that point.
-- **"Patient and wound" tab**: 7 scenarios, wound shape, size and depth.
+- **"Body" tab**: 8 body sites (each with its own layer thicknesses, local blood supply,
+  appendage density and skin flora), the size of the simulated skin patch, and 7 scenarios.
+- **"Wound" tab**: wound shape, size and depth.
 - **"Treatment" tab**: 6 antiseptics with their profile (potency, penetration into biofilm and
   necrosis, toxicity to epithelium and fibroblasts) — a single application or dressing changes
   every 12/24 h; 3 systemic antibiotics that can be combined (a dose every 8/12/24 h, plasma
@@ -48,6 +50,9 @@ cargo run --release --bin body-sim -- --scenario diabetic-foot --depth 5 --days 
 cargo run --release --bin body-sim -- --scenario necrotizing --antibiotics cefazolin:8,clindamycin:8 --treat-from 0.5 --debride 0.5,1.5,3
 cargo run --release --bin body-sim -- --scenario infected --antiseptic hypochlorous --antiseptic-every 12
 cargo run --release --bin body-sim -- --scenario diabetic-foot --antibiotics vancomycin:12 --debriders larvae,hydrogel
+cargo run --release --bin body-sim -- --site shin --lesion 12 --days 60 --no-map
+cargo run --release --bin body-sim -- --site sacrum --scenario diabetic --depth 4 --days 60
+cargo run --release --bin body-sim -- --area 60x40 --size 12 --days 40 --no-map   # a larger patch
 cargo run --release --bin body-sim -- --depth 9 --days 60 --no-map     # muscle and fat regeneration
 cargo run --release --bin body-sim -- --help
 ```
@@ -58,7 +63,7 @@ cargo run --release --bin body-sim -- --help
 cargo test
 ```
 
-92 tests, ~1 min; CI (GitHub Actions) runs them on Ubuntu and Windows on every push,
+106 tests, ~2.5 min; CI (GitHub Actions) runs them on Ubuntu and Windows on every push,
 plus `cargo fmt --check` and `cargo clippy -D warnings`.
 Unit test coverage: `cargo llvm-cov --release --lib --bins` (~20 s) — the model core is 83–100%,
 58% overall (the window, the buttons and the 3D rendering need a GPU and are not covered).
@@ -100,6 +105,76 @@ will be needed for undermining and tracking under the wound edges — not yet.
 | Muscle | satellite cells build new fibres: after a small defect ~50% by day 7–8 and ~75–80% by weeks 3–4; the capacity falls exponentially with the volume lost (volumetric muscle loss) — a large defect scars instead; infection, necrosis and ischemia shift the outcome towards fibrosis |
 | Fat | barely returns in an adult wound (adipocytes appear only near new follicles): a few per cent over 1–2 months, the rest is fibrous scar and a contour depression where the wound healed |
 | Remodeling | collagen maturation; a scar is never stronger than ~84% of healthy skin |
+| Body site | the skin of a forearm, a face, a shin or a sole differs in layer thickness, local blood supply, appendage density and resident flora; the site also fixes how large the body region is, which turns the wound into a share of the body surface |
+
+## Body site
+
+`--site` picks where on the body the wound is. The site sets the anatomy of the tissue column
+and the local physiology, and the scenario (the patient's disease) is applied on top of it —
+the site describes the tissue, the scenario describes the person.
+
+| Site | Epidermis | Dermis | Fat | Blood flow | Appendages | % of body surface |
+|---|---|---|---|---|---|---|
+| forearm | 0.10 mm | 2.0 mm | 6 mm | ×1.00 | ×1.0 | 3% |
+| face | 0.07 mm | 1.2 mm | 2 mm | ×1.35 | ×3.0 | 3% |
+| scalp | 0.08 mm | 1.8 mm | 3 mm | ×1.30 | ×8.0 | 3% |
+| back | 0.10 mm | 3.5 mm | 8 mm | ×0.90 | ×0.8 | 13% |
+| abdomen | 0.08 mm | 2.0 mm | 12 mm | ×0.90 | ×0.7 | 9% |
+| shin | 0.09 mm | 1.5 mm | 2 mm | ×0.55 | ×0.6 | 7% |
+| sole | 1.00 mm | 2.0 mm | 10 mm | ×0.80 | ×0.35 | 1.5% |
+| sacrum | 0.10 mm | 2.0 mm | 4 mm | ×0.60 | ×0.6 | 1.2% |
+
+The forearm is the reference: the model was calibrated on this anatomy, so its numbers are the
+previous defaults rather than a separate measurement. The rest are order-of-magnitude figures for
+an adult from ultrasound and histology reviews; the body-surface shares follow the rule of nines
+against a reference body surface of 1.73 m².
+
+A full-thickness wound (the whole dermis lost, so neither site keeps any appendages) heals at a
+speed set by the blood supply and the wound bed:
+
+| Site | Skin thickness | Full-thickness depth | Epithelialization |
+|---|---|---|---|
+| face | 1.27 mm | 1.77 mm | 27.0 d |
+| scalp | 1.88 mm | 2.38 mm | 27.9 d |
+| forearm | 2.10 mm | 2.60 mm | 29.5 d |
+| abdomen | 2.08 mm | 2.58 mm | 30.0 d |
+| back | 3.60 mm | 4.10 mm | 31.2 d |
+| sole | 3.00 mm | 3.50 mm | 31.2 d |
+| shin | 1.59 mm | 2.09 mm | 33.4 d |
+| sacrum | 2.10 mm | 2.60 mm | 34.5 d |
+
+Note that wounds of the same depth in millimetres are **not** comparable across sites: 1 mm takes
+three quarters of the thin dermis of a face but only three fifths of a shin's, so on the face the
+better perfusion is cancelled out by the wound simply being deeper in relative terms. This falls
+out of the model rather than being put in by hand.
+
+## Size of the affected area
+
+The simulated patch is a representative window into the lesion, not the whole of it.
+`--area` sets the physical size of that window in millimetres and `--cell` its resolution;
+`--lesion` states what share of the body region is affected, which turns into a share of the
+whole body surface and drives the systemic severity:
+
+```bash
+cargo run --release --bin body-sim -- --site shin --area 60x40 --lesion 12
+```
+
+```
+Место: передняя поверхность голени | участок 60×40 мм (240×160 клеток по 0.25 мм), область тела 1211 см² (7.0% поверхности)
+Поражено 12% этой области = 145 см², это 0.84% поверхности тела; участок — её представительный кусок
+```
+
+The diffusion coefficients are calibrated in cells²/h on the 0.25 mm grid, so changing the
+resolution converts them to mm²/h; otherwise a coarser grid would silently change the physics.
+The conversion is applied once, to the Laplacians, and is exactly 1.0 at the reference resolution,
+so previous runs do not change by a single bit. A clinical regression test pins the property: the
+same wound closes within 20% of the same day at 0.25 mm and 0.5 mm.
+
+The time step follows the grid: the coefficients grow as 1/cell_mm², so `fit_dt` shrinks `dt` to
+stay below the stability limit of the explicit scheme with a margin. The margin matters — exactly
+at the limit the checkerboard mode has an amplification factor of −1, so it neither grows nor
+decays, the oxygen field rings from cell to cell, dips below the critical level locally and
+produces sterile necrosis that is a numerical artefact rather than physiology.
 
 ## Calibration
 
@@ -196,6 +271,7 @@ src/
   tissue.rs      Tissue — the state of a tissue patch, inflicting a wound of a given depth
   sim.rs         one model step: explicit Euler, dt = 0.1 h
   therapy.rs     antiseptics, antibiotics (PK/PD), debridement, a log of procedures
+  body.rs        body sites: skin anatomy, local physiology, region areas and body-surface shares
   calibration.rs calibration: literature targets, stages, the Nelder–Mead optimizer
   bin/calibrate.rs  runs the calibration
   simulation.rs  the run over time: tissue + treatment + an hourly history of metrics
@@ -225,6 +301,15 @@ src/
 - No wound contraction, mechanics, edema, pressure (pressure ulcers) or revascularization
   in ischemia.
 - No systemic level: sepsis here is an estimate of the infected area, not a model of the organism.
+  It fires when the infection takes over the simulated patch, or when the affected body surface
+  exceeds 10% — both are area thresholds, not physiology.
+- The site figures are order-of-magnitude values for an adult, not a specific patient, and only
+  the forearm is tied to the calibration. The effect of appendage density is weaker than in
+  reality: `adnexal_rate` sits at its lower calibration bound, so even the scalp's follicles
+  cannot reproduce how much faster donor sites heal there.
+- The patch is treated as a representative window into the lesion, so `--lesion` scales the
+  measured fractions to the real area rather than simulating it. A lesion large enough for its
+  own gradients (a burn with a healing edge and a dying centre) is not captured.
 - Cells are not agents: no chemotaxis and no directed migration.
 
 ## Roadmap

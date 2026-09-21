@@ -1,7 +1,8 @@
 //! Клиническая регрессия: модель должна воспроизводить известные исходы.
 //! Пороги намеренно широкие — проверяется качественное поведение, а не точные числа.
 
-use body_sim::params::Scenario;
+use body_sim::body::BodySite;
+use body_sim::params::{Params, Scenario};
 use body_sim::report::{Condition, Metrics};
 use body_sim::simulation::Simulation;
 use body_sim::therapy::{Antibiotic, Antiseptic, Debrider};
@@ -304,4 +305,66 @@ fn necrotizing_infection_spreads_within_days_and_clindamycin_delays_it() {
     let treated = run(wound(Scenario::Necrotizing, 2.5), 12.0, &plan);
     let delayed = first_day(&treated, Condition::Spreading).unwrap_or(f32::INFINITY);
     assert!(delayed > spread + 2.0, "клиндамицин тормозит токсины: {delayed:.1} против {spread:.1}");
+}
+
+/// Коэффициенты диффузии заданы в клетках²/ч на опорной сетке 0.25 мм. Если их не
+/// переводить в физические единицы, смена разрешения молча меняет физику: тот же
+/// дефект заживает за другой срок. Допуск широкий — явная схема первого порядка.
+#[test]
+fn healing_does_not_depend_on_grid_resolution() {
+    let closure = |cell_mm: f32| {
+        let mut p = Params { cell_mm, ..Scenario::Healthy.params() };
+        p.fit_dt();
+        let cells = |mm: f32| (mm / cell_mm).round() as usize;
+        let mut sim = Simulation::new(p, cells(24.0), cells(12.0), WoundShape::Circle { radius: 4.0 / cell_mm }, 0.3);
+        let per_day = 24 * sim.steps_per_hour();
+        for _ in 0..25 {
+            sim.run_steps(per_day);
+            if sim.closed_at.is_some() {
+                break;
+            }
+        }
+        closed_day(&sim).expect("поверхностная рана обязана закрыться")
+    };
+    let fine = closure(0.25);
+    let coarse = closure(0.5);
+    assert!(
+        (fine - coarse).abs() / fine < 0.2,
+        "срок заживления поехал со сменой разрешения: {fine:.1} против {coarse:.1} дня"
+    );
+}
+
+/// Место на теле должно менять исход в понятную сторону: полнослойная рана на лице
+/// с его щедрым кровоснабжением заживает быстрее, чем на голени.
+///
+/// Сравнивать надо раны одинаковой глубины *относительно кожи места*, а не одинаковой
+/// в миллиметрах: дерма лица тоньше, и рана 1 мм уносит её на три четверти, тогда как
+/// на голени — чуть больше половины. При равной абсолютной глубине выигрыш в кровотоке
+/// съедается тем, что для тонкой кожи та же рана попросту глубже.
+#[test]
+fn full_thickness_wounds_heal_faster_on_the_face_than_on_the_shin() {
+    let closure = |site: BodySite| {
+        let p = Scenario::Healthy.params_at(site);
+        let r = 4.0 / p.cell_mm;
+        // Полнослойная рана: вся дерма утрачена, уцелевших придатков нет ни там, ни там,
+        // поэтому разницу задают кровоток и дно раны.
+        let depth = p.skin_bottom_mm() + 0.5;
+        assert_eq!(p.residual_dermis(depth), 0.0, "{}: дерма должна быть утрачена целиком", site.key());
+        let sim = run(Simulation::new(p, W, H, WoundShape::Circle { radius: r }, depth), 90.0, &Plan::default());
+        closed_day(&sim)
+    };
+    let face = closure(BodySite::Face).expect("рана на лице должна зажить");
+    let shin = closure(BodySite::Shin).expect("рана на голени должна зажить за 90 дней");
+    assert!(face < shin, "лицо {face:.1} дн. против голени {shin:.1} дн.");
+}
+
+/// Одна и та же по глубине рана достаёт до разных слоёв в зависимости от места:
+/// на голени 2.5 мм — это уже клетчатка, на спине — ещё дерма.
+#[test]
+fn the_same_depth_reaches_different_layers_by_site() {
+    let shin = Scenario::Healthy.params_at(BodySite::Shin);
+    let back = Scenario::Healthy.params_at(BodySite::Back);
+    assert_eq!(shin.layer_title(2.5), "жировая клетчатка");
+    assert_eq!(back.layer_title(2.5), "дерма (пограничная)");
+    assert!(back.max_depth_mm > shin.max_depth_mm, "под спиной колонка толще");
 }

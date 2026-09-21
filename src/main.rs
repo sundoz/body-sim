@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
 
+use body_sim::body::BodySite;
 use body_sim::params::Scenario;
 use body_sim::report::{self, Condition, Metrics, Phase, View};
 use body_sim::simulation::Simulation;
@@ -16,6 +17,11 @@ body-sim — симулятор заживления кожной раны (ко
 Пациент и рана:
   --scenario <s>   healthy | diabetic | infected | elderly |
                    ischemic | diabetic-foot | necrotizing      (healthy)
+  --site <m>       место на теле: forearm | face | scalp | back |
+                   abdomen | shin | sole | sacrum             (forearm)
+                   задаёт толщину слоёв, кровоток, придатки и флору
+  --lesion <%>     какая доля этой области тела поражена — моделируемый
+                   участок считается её представительным куском
   --wound <w>      circle | cut                              (circle)
   --size <мм>      радиус круглой раны / четверть длины разреза (4)
   --depth <мм>     глубина: 0.1 эпидермис, 1 дерма, 2.5 полнослойная,
@@ -40,12 +46,16 @@ body-sim — симулятор заживления кожной раны (ко
                    neutrophils, macrophages, fibroblasts, antiseptic, antibiotic
   --no-map         не рисовать карты, только цифры
   --csv <файл>     записать почасовую динамику в CSV
-  --grid <WxH>     размер сетки в клетках по 0.25 мм         (96x48)
+  --area <ШxВ>     физический размер участка, мм              (24x12)
+  --cell <мм>      сторона клетки сетки                        (0.25)
+  --grid <WxH>     размер сетки в клетках (вместо --area)      (96x48)
   -h, --help       эта справка
 ";
 
 struct Cli {
     scenario: Scenario,
+    site: BodySite,
+    lesion: Option<f32>,
     wound: String,
     size_mm: f32,
     depth_mm: f32,
@@ -60,6 +70,9 @@ struct Cli {
     view: View,
     map: bool,
     csv: Option<String>,
+    cell_mm: f32,
+    grid: Option<(usize, usize)>,
+    area_mm: Option<(f32, f32)>,
     w: usize,
     h: usize,
 }
@@ -67,6 +80,8 @@ struct Cli {
 fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Option<Cli>, String> {
     let mut cli = Cli {
         scenario: Scenario::Healthy,
+        site: BodySite::Forearm,
+        lesion: None,
         wound: "circle".into(),
         size_mm: 4.0,
         depth_mm: 2.5,
@@ -81,6 +96,9 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Option<Cli>, Str
         view: View::Integrity,
         map: true,
         csv: None,
+        cell_mm: body_sim::params::CALIBRATION_CELL_MM,
+        grid: None,
+        area_mm: None,
         w: 96,
         h: 48,
     };
@@ -92,6 +110,17 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Option<Cli>, Str
             "--scenario" => {
                 let v = val()?;
                 cli.scenario = Scenario::parse(&v).ok_or_else(|| format!("неизвестный сценарий: {v}"))?;
+            }
+            "--site" => {
+                let v = val()?;
+                cli.site = BodySite::parse(&v).ok_or_else(|| format!("неизвестное место на теле: {v}"))?;
+            }
+            "--lesion" => {
+                let v = non_negative(&val()?, "--lesion")?;
+                if v > 100.0 {
+                    return Err("--lesion: доля области тела не может превышать 100%".into());
+                }
+                cli.lesion = Some(v);
             }
             "--wound" => {
                 let v = val()?;
@@ -141,17 +170,35 @@ fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Option<Cli>, Str
             }
             "--no-map" => cli.map = false,
             "--csv" => cli.csv = Some(val()?),
+            "--cell" => cli.cell_mm = num(&val()?)?,
+            "--area" => {
+                let v = val()?;
+                let (w, h) = v.split_once('x').ok_or("формат --area: 24x12")?;
+                cli.area_mm = Some((num(w.trim())?, num(h.trim())?));
+            }
             "--grid" => {
                 let v = val()?;
                 let (w, h) = v.split_once('x').ok_or("формат --grid: 96x48")?;
-                cli.w = w.parse().map_err(|_| "формат --grid: 96x48")?;
-                cli.h = h.parse().map_err(|_| "формат --grid: 96x48")?;
-                if cli.w == 0 || cli.h == 0 {
+                let w: usize = w.parse().map_err(|_| "формат --grid: 96x48")?;
+                let h: usize = h.parse().map_err(|_| "формат --grid: 96x48")?;
+                if w == 0 || h == 0 {
                     return Err("--grid: размеры сетки должны быть больше нуля".into());
                 }
+                cli.grid = Some((w, h));
             }
             _ => return Err(format!("неизвестная опция: {a}")),
         }
+    }
+    // Размер сетки разрешаем после разбора: --cell может стоять после --area.
+    if let Some((aw, ah)) = cli.area_mm {
+        cli.w = (aw / cli.cell_mm).round() as usize;
+        cli.h = (ah / cli.cell_mm).round() as usize;
+        if cli.w == 0 || cli.h == 0 {
+            return Err("--area: участок меньше одной клетки сетки, уменьшите --cell".into());
+        }
+    } else if let Some((w, h)) = cli.grid {
+        cli.w = w;
+        cli.h = h;
     }
     Ok(Some(cli))
 }
@@ -200,11 +247,26 @@ fn main() -> ExitCode {
         }
     };
 
-    let p = cli.scenario.params();
+    let mut p = cli.scenario.params_at(cli.site);
+    p.cell_mm = cli.cell_mm;
+    p.lesion_percent = cli.lesion;
+    // Коэффициенты диффузии растут как 1/cell_mm², поэтому на мелкой сетке
+    // прежний шаг по времени перестаёт быть устойчивым — подбираем его.
+    p.fit_dt();
+    if p.dt < body_sim::params::CALIBRATION_DT {
+        eprintln!(
+            "внимание: сетка {:.2} мм требует шага {:.3} ч вместо {:.1} — счёт будет во столько же раз дольше",
+            p.cell_mm,
+            p.dt,
+            body_sim::params::CALIBRATION_DT
+        );
+    }
     if cli.depth_mm > p.max_depth_mm {
         eprintln!(
-            "ошибка: --depth {:.1} мм глубже моделируемой колонки ткани ({:.1} мм)",
-            cli.depth_mm, p.max_depth_mm
+            "ошибка: --depth {:.1} мм глубже колонки ткани на этом месте ({}: {:.1} мм)",
+            cli.depth_mm,
+            cli.site.title(),
+            p.max_depth_mm
         );
         return ExitCode::FAILURE;
     }
@@ -253,6 +315,26 @@ fn main() -> ExitCode {
     let snap_every = ((cli.every * 24.0).round() as usize).max(1);
 
     let initial = sim.latest().clone();
+    let p_cell = cli.cell_mm;
+    println!(
+        "Место: {} | участок {:.0}×{:.0} мм ({}×{} клеток по {:.2} мм), область тела {:.0} см² ({:.1}% поверхности)",
+        cli.site.title(),
+        cli.w as f32 * p_cell,
+        cli.h as f32 * p_cell,
+        cli.w,
+        cli.h,
+        p_cell,
+        cli.site.region_cm2(),
+        cli.site.props().tbsa_percent
+    );
+    if let Some(pct) = cli.lesion {
+        println!(
+            "Поражено {:.0}% этой области = {:.0} см², это {:.2}% поверхности тела; участок — её представительный кусок",
+            pct,
+            cli.site.region_cm2() * pct / 100.0,
+            cli.site.props().tbsa_percent * pct / 100.0
+        );
+    }
     println!(
         "Сценарий: {} | рана: {} {:.1} мм, глубина {:.1} мм ({}), площадь {:.1} мм² | {} дней",
         cli.scenario.title(),
@@ -472,6 +554,31 @@ mod tests {
     }
 
     #[test]
+    fn area_is_converted_to_a_grid_at_the_chosen_resolution() {
+        let cli = parse(&["--area", "60x40"]).unwrap().unwrap();
+        assert_eq!((cli.w, cli.h), (240, 160), "60×40 мм по 0.25 мм");
+        // Разрешение учитывается независимо от порядка опций.
+        for args in [["--area", "100x100", "--cell", "0.5"], ["--cell", "0.5", "--area", "100x100"]] {
+            let cli = parse(&args).unwrap().unwrap();
+            assert_eq!((cli.w, cli.h), (200, 200), "{args:?}");
+            assert_eq!(cli.cell_mm, 0.5);
+        }
+        // Без --area сетка задаётся прежним способом.
+        assert_eq!(parse(&[]).unwrap().unwrap().w, 96);
+    }
+
+    #[test]
+    fn site_and_lesion_are_parsed() {
+        let cli = parse(&["--site", "shin", "--lesion", "12.5"]).unwrap().unwrap();
+        assert_eq!(cli.site, BodySite::Shin);
+        assert_eq!(cli.lesion, Some(12.5));
+        let cli = parse(&[]).unwrap().unwrap();
+        assert_eq!(cli.site, BodySite::Forearm, "по умолчанию — опорная анатомия");
+        assert_eq!(cli.lesion, None);
+        assert_eq!(parse(&["--lesion", "100"]).unwrap().unwrap().lesion, Some(100.0), "вся область — предел");
+    }
+
+    #[test]
     fn errors_are_reported() {
         for bad in [
             vec!["--scenario", "zombie"],
@@ -482,6 +589,11 @@ mod tests {
             vec!["--days"],
             vec!["--grid", "40"],
             vec!["--grid", "0x48"],
+            vec!["--site", "elbow"],
+            vec!["--lesion", "120"],
+            vec!["--lesion", "-5"],
+            vec!["--area", "0x12"],
+            vec!["--cell", "0"],
             vec!["--grid", "96x0"],
             vec!["--treat-from", "-1"],
             vec!["--debride", "1,-2"],
